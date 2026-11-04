@@ -1,4 +1,3 @@
-
 local CFG = {
 	Radius      = 50,
 	CamSmooth   = 0.35,
