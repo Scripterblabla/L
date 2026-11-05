@@ -1,0 +1,3948 @@
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
+local Lighting = game:GetService("Lighting")
+local SoundService = game:GetService("SoundService")
+local Workspace = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local humanoid = character:WaitForChild("Humanoid")
+local playerGui = player:WaitForChild("PlayerGui")
+
+local sharedEnv = _G
+do
+	local ok, g = pcall(function() return getgenv() end)
+	if ok and type(g) == "table" then sharedEnv = g end
+end
+if type(sharedEnv.R6RecorderCleanup) == "function" then
+	pcall(sharedEnv.R6RecorderCleanup)
+end
+
+local CONFIG = {
+	FolderName = "r6recorder",
+	DexFolderName = "R6Recorder",
+	ReplayKey = Enum.KeyCode.R,
+	ReplayVFX = true,
+	VFXRadius = 150,
+	IncludeOtherPlayers = false,
+	TrackEffectParts = true,
+	SampleEpsilon = 0.01,
+	WatchInterval = 1 / 30,
+	StringChunk = 100000,
+	AutoClipboard = true,
+	AutoReplay = true,
+	SaveToDisk = true,
+
+	RecordModels = true,
+	RecordLooseParts = true,
+	IncludePresentModels = false,
+	IncludeHumanoidModels = false,
+	ModelRadius = 150,
+	ModelSubParts = 40,
+	MaxModels = 2500,
+	MaxModelParts = 2000,
+	MaxModelSamples = 35000,
+	MaxSubPartSamples = 35000,
+	ModelSampleBudget = 0.004,
+
+	CopyLimit = 950000,
+	CopyAllLimit = 950000,
+	ScreenReportLimit = 650000,
+	ScreenPageChars = 35500,
+	DexStringLimit = 400000,
+
+	MaxEventsPerVFX = 35000,
+	MaxSamplesPerVFX = 35000,
+	MaxEmitsPerVFX = 35000,
+	MaxVFX = 3500,
+	MaxEffectParts = 35000,
+	MaxClones = 35000,
+	MaxFrames = 35000,
+	MaxCamSamples = 35000,
+	MaxPendingQueue = 35000,
+	QueueBudget = 0.002,
+	MaxTimelineLines = 35000,
+	KeepSessions = 3,
+
+	SliceBudget = 0.010,
+	StringChunkYield = 4,
+	AnimTolerance = 0.02,
+	AnimMaxKeyframes = 150,
+}
+
+local setClipboard, writeFile, makeFolder, isFolder
+do
+	local function envFn(...)
+		local names = { ... }
+		local function lookup(getEnv)
+			local ok, env = pcall(getEnv)
+			if ok and type(env) == "table" then
+				for _, n in ipairs(names) do
+					local ok2, f = pcall(function() return env[n] end)
+					if ok2 and type(f) == "function" then return f end
+				end
+			end
+			return nil
+		end
+		return lookup(function() return getgenv() end) or lookup(getfenv)
+	end
+
+	setClipboard = envFn("setclipboard", "toclipboard", "set_clipboard", "writeclipboard")
+		or (type(setclipboard) == "function" and setclipboard)
+		or (type(toclipboard) == "function" and toclipboard) or nil
+	if not setClipboard then
+		local okG, g = pcall(function() return getgenv() end)
+		if okG and type(g) == "table" then
+			if type(g.syn) == "table" and type(g.syn.write_clipboard) == "function" then
+				setClipboard = g.syn.write_clipboard
+			elseif type(g.Clipboard) == "table" and type(g.Clipboard.set) == "function" then
+				setClipboard = g.Clipboard.set
+			end
+		end
+	end
+	writeFile = envFn("writefile") or (type(writefile) == "function" and writefile) or nil
+	makeFolder = envFn("makefolder") or (type(makefolder) == "function" and makefolder) or nil
+	isFolder = envFn("isfolder") or (type(isfolder) == "function" and isfolder) or nil
+end
+
+local function makeArchivable(model)
+	pcall(function()
+		model.Archivable = true
+		for _, v in ipairs(model:GetDescendants()) do v.Archivable = true end
+	end)
+end
+makeArchivable(character)
+
+local function rnd(n)
+	if n ~= n or n == math.huge or n == -math.huge then return 0 end
+	return math.round(n * 10000) / 10000
+end
+
+local function cfArr(cf)
+	local t = { cf:GetComponents() }
+	for i, v in ipairs(t) do t[i] = rnd(v) end
+	return t
+end
+
+local function ser(v)
+	local tv = typeof(v)
+	if tv == "number" then return rnd(v)
+	elseif tv == "string" or tv == "boolean" then return v
+	elseif tv == "Vector3" then return { rnd(v.X), rnd(v.Y), rnd(v.Z) }
+	elseif tv == "Vector2" then return { rnd(v.X), rnd(v.Y) }
+	elseif tv == "Color3" then return "#" .. v:ToHex()
+	elseif tv == "CFrame" then return cfArr(v)
+	elseif tv == "NumberRange" then return { rnd(v.Min), rnd(v.Max) }
+	elseif tv == "NumberSequence" then
+		local out = {}
+		for _, k in ipairs(v.Keypoints) do table.insert(out, { rnd(k.Time), rnd(k.Value), rnd(k.Envelope) }) end
+		return out
+	elseif tv == "ColorSequence" then
+		local out = {}
+		for _, k in ipairs(v.Keypoints) do table.insert(out, { rnd(k.Time), "#" .. k.Value:ToHex() }) end
+		return out
+	elseif tv == "EnumItem" then return tostring(v)
+	elseif tv == "Instance" then return v:GetFullName()
+	elseif tv == "Content" then
+		local ok, uri = pcall(function() return v.Uri end)
+		return (ok and uri) or tostring(v)
+	end
+	return tostring(v)
+end
+
+local function readProps(inst, list)
+	local out = {}
+	for _, p in ipairs(list) do
+		local ok, v = pcall(function() return inst[p] end)
+		if ok and v ~= nil then out[p] = ser(v) end
+	end
+	return out
+end
+
+local function setAttr(inst, name, value)
+	pcall(function() inst:SetAttribute(name, value) end)
+end
+
+local function safeEncode(t)
+	local ok, res = pcall(function() return HttpService:JSONEncode(t) end)
+	if ok then return res end
+	return "{}"
+end
+
+local function fmtT(t) return ("%7.3fs"):format(t) end
+local function vec(v) return ("(%.2f, %.2f, %.2f)"):format(v.X, v.Y, v.Z) end
+local function rotDeg(cf)
+	local rx, ry, rz = cf:ToOrientation()
+	return ("(%.0f, %.0f, %.0f)"):format(math.deg(rx), math.deg(ry), math.deg(rz))
+end
+local function fmtClock(t) return ("%02d:%04.1f"):format(math.floor(t / 60), t % 60) end
+local function formatNum(n)
+	local s = tostring(math.floor(n))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,")
+	out = out:reverse()
+	if out:sub(1, 1) == "," then out = out:sub(2) end
+	return out
+end
+
+local sliceStart = os.clock()
+local function resetSlice() sliceStart = os.clock() end
+local function slice()
+	if os.clock() - sliceStart >= CONFIG.SliceBudget then
+		task.wait()
+		sliceStart = os.clock()
+	end
+end
+
+local function newBuf()
+	local b = { n = 0, parts = {} }
+	function b.add(s)
+		b.n += 1
+		b.parts[b.n] = s
+		if b.n % 40 == 0 then slice() end
+	end
+	function b.text() return table.concat(b.parts, "\n") end
+	return b
+end
+
+local function fitText(text, limit, note)
+	if #text <= limit then return text, false end
+	local cut = text:sub(1, limit)
+	local upTo = cut:match("^(.*)\n")
+	if upTo and #upTo > limit * 0.5 then cut = upTo end
+	return cut .. "\n" .. (note or "...(cut for size - the full version is saved on disk in the session folder)"), true
+end
+
+local function paginate(text, size)
+	local pages = {}
+	local pos, len = 1, #text
+	while pos <= len do
+		local stop = math.min(pos + size - 1, len)
+		if stop < len then
+			local chunk = text:sub(pos, stop)
+			local lastNl = chunk:match("^.*()\n")
+			if lastNl and lastNl > size * 0.4 then stop = pos + lastNl - 1 end
+		end
+		pages[#pages + 1] = text:sub(pos, stop)
+		pos = stop + 1
+	end
+	if #pages == 0 then pages[1] = "" end
+	return pages
+end
+
+local function storeLongString(parent, baseName, str)
+	local n = 0
+	for i = 1, #str, CONFIG.StringChunk do
+		n += 1
+		local sv = Instance.new("StringValue")
+		sv.Name = ("%s_%02d"):format(baseName, n)
+		sv.Value = str:sub(i, i + CONFIG.StringChunk - 1)
+		sv.Parent = parent
+		if n % CONFIG.StringChunkYield == 0 then slice() end
+	end
+	return n
+end
+
+local function dexJson(str, fileName)
+	if #str <= CONFIG.DexStringLimit then return str end
+	return ("TOO LARGE FOR DEX (%s chars). Open the saved file instead: workspace/%s/<session>/%s"):format(
+		formatNum(#str), CONFIG.FolderName, fileName)
+end
+
+local function encodeArray(list, chunkSize, map)
+	local parts = {}
+	local n = #list
+	local i = 1
+	while i <= n do
+		local chunk = {}
+		for j = i, math.min(i + chunkSize - 1, n) do
+			chunk[#chunk + 1] = map and map(list[j]) or list[j]
+		end
+		local s = safeEncode(chunk)
+		if #s > 2 then parts[#parts + 1] = s:sub(2, -2) end
+		i += chunkSize
+		slice()
+	end
+	return "[" .. table.concat(parts, ",") .. "]"
+end
+
+local function jsonWithArrays(head, arrays)
+	local base = safeEncode(head)
+	local body = base:sub(2, -2)
+	local pieces = {}
+	if body ~= "" then pieces[1] = body end
+	for _, a in ipairs(arrays) do
+		pieces[#pieces + 1] = '"' .. a[1] .. '":' .. a[2]
+	end
+	return "{" .. table.concat(pieces, ",") .. "}"
+end
+
+local function fitAttrJson(list, limit)
+	local n = math.min(#list, 2000)
+	local out = list
+	if n < #list then out = table.move(list, 1, n, 1, {}) end
+	local s = safeEncode(out)
+	while #s > limit and n > 1 do
+		n = math.floor(n * 0.7)
+		out = table.move(list, 1, n, 1, {})
+		s = safeEncode(out)
+		slice()
+	end
+	return s
+end
+
+local function relPath(inst, anc)
+	local t = {}
+	local c = inst
+	while c and c ~= anc do
+		table.insert(t, 1, c.Name)
+		c = c.Parent
+	end
+	return t
+end
+
+local CLASS_CATEGORY = {
+	ParticleEmitter = "Particle", Trail = "Trail", Beam = "Beam",
+	PointLight = "Light", SpotLight = "Light", SurfaceLight = "Light",
+	Fire = "Fire", Smoke = "Smoke", Sparkles = "Sparkles", Explosion = "Explosion",
+	Highlight = "Highlight", Sound = "Sound",
+	BlurEffect = "PostFX", BloomEffect = "PostFX", ColorCorrectionEffect = "PostFX",
+	SunRaysEffect = "PostFX", DepthOfFieldEffect = "PostFX",
+}
+
+local PROPS = {
+	ParticleEmitter = { "Enabled", "Texture", "Color", "Size", "Transparency", "Lifetime", "Rate", "Speed", "Rotation", "RotSpeed",
+		"SpreadAngle", "Acceleration", "Drag", "LightEmission", "LightInfluence", "Brightness", "Orientation", "EmissionDirection",
+		"ZOffset", "LockedToPart", "VelocityInheritance", "TimeScale", "Squash", "Shape", "ShapeStyle", "ShapeInOut", "ShapePartial",
+		"FlipbookLayout", "FlipbookMode", "FlipbookFramerate", "FlipbookStartRandom", "WindAffectsDrag" },
+	Trail = { "Enabled", "Texture", "Color", "Transparency", "Lifetime", "MinLength", "MaxLength", "WidthScale", "LightEmission",
+		"LightInfluence", "Brightness", "FaceCamera", "TextureMode", "TextureLength", "Attachment0", "Attachment1" },
+	Beam = { "Enabled", "Texture", "Color", "Transparency", "Width0", "Width1", "CurveSize0", "CurveSize1", "Segments", "LightEmission",
+		"LightInfluence", "Brightness", "FaceCamera", "TextureMode", "TextureLength", "TextureSpeed", "ZOffset", "Attachment0", "Attachment1" },
+	PointLight = { "Enabled", "Brightness", "Color", "Range", "Shadows" },
+	SpotLight = { "Enabled", "Brightness", "Color", "Range", "Angle", "Face", "Shadows" },
+	SurfaceLight = { "Enabled", "Brightness", "Color", "Range", "Angle", "Face", "Shadows" },
+	Fire = { "Enabled", "Color", "SecondaryColor", "Size", "Heat", "TimeScale" },
+	Smoke = { "Enabled", "Color", "Size", "Opacity", "RiseVelocity", "TimeScale" },
+	Sparkles = { "Enabled", "SparkleColor", "TimeScale" },
+	Explosion = { "BlastPressure", "BlastRadius", "DestroyJointRadiusPercent", "ExplosionType", "Position", "Visible" },
+	Highlight = { "Enabled", "Adornee", "FillColor", "FillTransparency", "OutlineColor", "OutlineTransparency", "DepthMode" },
+	Sound = { "SoundId", "Volume", "PlaybackSpeed", "TimePosition", "TimeLength", "Looped", "Playing", "RollOffMode",
+		"RollOffMinDistance", "RollOffMaxDistance" },
+	BlurEffect = { "Enabled", "Size" },
+	BloomEffect = { "Enabled", "Intensity", "Size", "Threshold" },
+	ColorCorrectionEffect = { "Enabled", "Brightness", "Contrast", "Saturation", "TintColor" },
+	SunRaysEffect = { "Enabled", "Intensity", "Spread" },
+	DepthOfFieldEffect = { "Enabled", "FarIntensity", "FocusDistance", "InFocusRadius", "NearIntensity" },
+}
+
+local PART_PROPS = { "Size", "Color", "Material", "Transparency", "Reflectance", "CanCollide", "Anchored", "Shape", "MeshId",
+	"TextureID", "CastShadow" }
+
+local CHILD_PROPS = {
+	SpecialMesh = { "MeshType", "MeshId", "TextureId", "Scale", "Offset", "VertexColor" },
+	Decal = { "Texture", "Color3", "Transparency", "Face" },
+	Texture = { "Texture", "Color3", "Transparency", "Face", "StudsPerTileU", "StudsPerTileV" },
+	SurfaceAppearance = { "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap" },
+}
+
+local ASSET_PROPS = { Texture = true, TextureID = true, TextureId = true, MeshId = true, SoundId = true, ColorMap = true,
+	NormalMap = true, MetalnessMap = true, RoughnessMap = true }
+
+local DEFAULT_CHAR_SOUNDS = { Died = true, Running = true, Swimming = true, Climbing = true, GettingUp = true,
+	FreeFalling = true, Landing = true, Splash = true, Jumping = true }
+
+local MODULE_HINTS = { "vfx", "effect", "fx", "camera", "shake", "cutscene", "skill", "move", "ability", "combat", "particle", "tween" }
+
+local JOINTS = {
+	{ partName = "Head", motorName = "Neck" },
+	{ partName = "Left Arm", motorName = "Left Shoulder" },
+	{ partName = "Right Arm", motorName = "Right Shoulder" },
+	{ partName = "Left Leg", motorName = "Left Hip" },
+	{ partName = "Right Leg", motorName = "Right Hip" },
+}
+
+local LOGO_B64 = "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"
+
+local UI = (function()
+	local M = { conns = {} }
+
+	local THEME = {
+		bg = Color3.fromRGB(10, 16, 21),
+		panel = Color3.fromRGB(15, 24, 31),
+		panel2 = Color3.fromRGB(21, 33, 42),
+		stroke = Color3.fromRGB(36, 62, 76),
+		text = Color3.fromRGB(232, 247, 251),
+		sub = Color3.fromRGB(125, 160, 174),
+		accent = Color3.fromRGB(94, 234, 255),
+		accent2 = Color3.fromRGB(0, 163, 204),
+		rec = Color3.fromRGB(240, 82, 108),
+		go = Color3.fromRGB(38, 178, 112),
+		ok = Color3.fromRGB(120, 238, 214),
+		warn = Color3.fromRGB(255, 184, 76),
+		model = Color3.fromRGB(94, 234, 255),
+	}
+	M.THEME = THEME
+
+	local DARK = Color3.fromRGB(4, 30, 38)
+
+	local function tween(obj, props, dur, style, dir)
+		local tw = TweenService:Create(obj,
+			TweenInfo.new(dur or 0.2, style or Enum.EasingStyle.Quint, dir or Enum.EasingDirection.Out), props)
+		tw:Play()
+		return tw
+	end
+
+	local function create(class, props)
+		local inst = Instance.new(class)
+		local parent = props.Parent
+		for k, v in pairs(props) do
+			if k ~= "Parent" then inst[k] = v end
+		end
+		inst.Parent = parent
+		return inst
+	end
+
+	local function newFrame(props)
+		local p = { BackgroundColor3 = THEME.panel, BorderSizePixel = 0 }
+		for k, v in pairs(props) do p[k] = v end
+		return create("Frame", p)
+	end
+
+	local function newLabel(props)
+		local p = {
+			BackgroundTransparency = 1, BorderSizePixel = 0, Font = Enum.Font.Gotham, TextSize = 12,
+			TextColor3 = THEME.text, TextXAlignment = Enum.TextXAlignment.Left, Text = "",
+		}
+		for k, v in pairs(props) do p[k] = v end
+		return create("TextLabel", p)
+	end
+
+	local function corner(parent, r)
+		local c = Instance.new("UICorner")
+		c.CornerRadius = UDim.new(0, r)
+		c.Parent = parent
+		return c
+	end
+
+	local function stroke(parent, color, thickness, transparency)
+		local s = Instance.new("UIStroke")
+		s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		s.Color = color
+		s.Thickness = thickness or 1
+		s.Transparency = transparency or 0
+		s.Parent = parent
+		return s
+	end
+
+	local function gradient(parent, c0, c1, rot)
+		local g = Instance.new("UIGradient")
+		g.Color = ColorSequence.new(c0, c1)
+		g.Rotation = rot or 0
+		g.Parent = parent
+		return g
+	end
+
+	local function fadeGradient(parent, rot, a, b)
+		local g = Instance.new("UIGradient")
+		g.Rotation = rot
+		g.Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, a), NumberSequenceKeypoint.new(1, b) })
+		g.Parent = parent
+		return g
+	end
+
+	local function listLayout(parent, dir, pad)
+		local l = Instance.new("UIListLayout")
+		l.FillDirection = dir
+		l.Padding = UDim.new(0, pad)
+		l.SortOrder = Enum.SortOrder.LayoutOrder
+		l.Parent = parent
+		return l
+	end
+
+	local function lighten(c, a) return c:Lerp(Color3.new(1, 1, 1), a) end
+
+	local function newCard(props, color)
+		local p = { BackgroundColor3 = color or THEME.panel }
+		for k, v in pairs(props) do p[k] = v end
+		local f = newFrame(p)
+		corner(f, 14)
+		stroke(f, THEME.stroke, 1, 0.5)
+		return f
+	end
+
+	local function badge(parent, pos, size, tint)
+		tint = THEME.accent
+		local b = newFrame({ Position = pos, Size = UDim2.fromOffset(size, size), BackgroundColor3 = tint,
+			BackgroundTransparency = 0.78, Parent = parent })
+		corner(b, size)
+		local d = newFrame({ AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(math.floor(size * 0.36), math.floor(size * 0.36)), BackgroundColor3 = tint, Parent = b })
+		corner(d, size)
+		return b
+	end
+
+	local function makeButton(parent, holderProps, text, color, textSize, radius, textColor)
+		local hp = { BackgroundTransparency = 1, Parent = parent }
+		for k, v in pairs(holderProps) do hp[k] = v end
+		local holder = newFrame(hp)
+		local btn = create("TextButton", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(1, 1),
+			BackgroundColor3 = color, BorderSizePixel = 0, AutoButtonColor = false, Text = text,
+			Font = Enum.Font.GothamBold, TextSize = textSize or 12, TextColor3 = textColor or THEME.text, Parent = holder,
+		})
+		corner(btn, radius or 10)
+		local press = Instance.new("UIScale")
+		press.Parent = btn
+		local glow = stroke(btn, lighten(color, 0.35), 1.5, 1)
+		local obj = { holder = holder, btn = btn, glow = glow, enabled = true, base = color, hover = lighten(color, 0.14) }
+
+		btn.MouseEnter:Connect(function()
+			if obj.enabled then
+				tween(btn, { BackgroundColor3 = obj.hover }, 0.18)
+				tween(glow, { Transparency = 0.55 }, 0.22)
+			end
+		end)
+		btn.MouseLeave:Connect(function()
+			tween(btn, { BackgroundColor3 = obj.base }, 0.25)
+			tween(glow, { Transparency = 1 }, 0.3)
+			tween(press, { Scale = 1 }, 0.25)
+		end)
+		btn.MouseButton1Down:Connect(function()
+			if obj.enabled then tween(press, { Scale = 0.95 }, 0.08) end
+		end)
+		btn.MouseButton1Up:Connect(function()
+			tween(press, { Scale = 1 }, 0.4, Enum.EasingStyle.Back)
+		end)
+
+		function obj.onClick(fn)
+			btn.Activated:Connect(function()
+				tween(press, { Scale = 1 }, 0.4, Enum.EasingStyle.Back)
+				if obj.enabled then fn() end
+			end)
+		end
+		function obj.setColor(c)
+			obj.base = c
+			obj.hover = lighten(c, 0.14)
+			tween(btn, { BackgroundColor3 = c }, 0.35)
+			glow.Color = lighten(c, 0.35)
+		end
+		function obj.setEnabled(on)
+			obj.enabled = on
+			tween(btn, { BackgroundTransparency = on and 0 or 0.6, TextTransparency = on and 0 or 0.55 }, 0.25)
+		end
+		function obj.setText(t) btn.Text = t end
+		return obj
+	end
+
+	do
+		local spots = { playerGui }
+		local okH, hui = pcall(function() return gethui and gethui() end)
+		if okH and typeof(hui) == "Instance" then table.insert(spots, hui) end
+		local okC, core = pcall(function() return game:GetService("CoreGui") end)
+		if okC and core then table.insert(spots, core) end
+		for _, spot in ipairs(spots) do
+			local okF, old = pcall(function() return spot:FindFirstChild("R6RecorderGui") end)
+			if okF and old then pcall(function() old:Destroy() end) end
+		end
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "R6RecorderGui"
+	screenGui.ResetOnSpawn = false
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.DisplayOrder = 999
+	M.screenGui = screenGui
+
+	do
+		pcall(function()
+			if syn and syn.protect_gui then syn.protect_gui(screenGui) end
+		end)
+		local placed = false
+		local okH, hui = pcall(function() return gethui and gethui() end)
+		if okH and typeof(hui) == "Instance" then
+			placed = pcall(function() screenGui.Parent = hui end) and screenGui.Parent ~= nil
+		end
+		if not placed then
+			placed = pcall(function() screenGui.Parent = game:GetService("CoreGui") end) and screenGui.Parent ~= nil
+		end
+		if not placed then screenGui.Parent = playerGui end
+	end
+
+	local WIN_W, H_MIN, H_COLLAPSED, H_EXPANDED, MINI_W = 400, 58, 532, 678, 270
+
+	local win = create("Frame", {
+		Name = "Window", Position = UDim2.fromOffset(16, -16), Size = UDim2.fromOffset(WIN_W, H_MIN),
+		BackgroundColor3 = THEME.bg, BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true, Parent = screenGui,
+	})
+	M.win = win
+	corner(win, 22)
+	gradient(stroke(win, Color3.new(1, 1, 1), 1.5, 0.3), THEME.accent, THEME.accent2, 40)
+	local winScale = Instance.new("UIScale")
+	winScale.Parent = win
+
+	local glowTop = newFrame({ Name = "GlowTop", Size = UDim2.new(1, 0, 0, 180), BackgroundColor3 = THEME.accent2, ZIndex = 0, Parent = win })
+	corner(glowTop, 22)
+	fadeGradient(glowTop, 90, 0.78, 1)
+	local glowBottom = newFrame({ Name = "GlowBottom", AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1),
+		Size = UDim2.new(1, 0, 0, 150), BackgroundColor3 = THEME.accent2, ZIndex = 0, Parent = win })
+	corner(glowBottom, 22)
+	fadeGradient(glowBottom, 90, 1, 0.86)
+
+	local header = newFrame({ Name = "Header", Size = UDim2.new(1, 0, 0, H_MIN), BackgroundTransparency = 1, Parent = win })
+	M.header = header
+	newFrame({ Position = UDim2.new(0, 16, 1, -1), Size = UDim2.new(1, -32, 0, 1), BackgroundColor3 = THEME.stroke, BackgroundTransparency = 0.45, Parent = header })
+
+	local logo = newFrame({ Position = UDim2.fromOffset(8, 7), Size = UDim2.fromOffset(44, 44), BackgroundTransparency = 1, Parent = header })
+	local logoText = newLabel({ Size = UDim2.fromScale(1, 1), Text = "R6", Font = Enum.Font.GothamBlack, TextSize = 13,
+		TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Center, Parent = logo })
+	local logoImg = create("ImageLabel", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ScaleType = Enum.ScaleType.Fit,
+		ImageTransparency = 1, Image = "", Parent = logo })
+	task.spawn(function()
+		local ok = pcall(function()
+			local okG, getAsset = pcall(function() return getcustomasset or getsynasset or (getgenv and getgenv().getcustomasset) end)
+			if not (okG and type(getAsset) == "function" and writeFile and makeFolder) then error("no custom asset support") end
+
+			local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+			local map = {}
+			for i = 1, 64 do map[chars:byte(i)] = i - 1 end
+			local out, n, buf, bits = {}, 0, 0, 0
+			for i = 1, #LOGO_B64 do
+				local v = map[LOGO_B64:byte(i)]
+				if v then
+					buf = buf * 64 + v
+					bits += 6
+					if bits >= 8 then
+						bits -= 8
+						local p = 2 ^ bits
+						n += 1
+						out[n] = string.char(math.floor(buf / p))
+						buf = buf % p
+					end
+				end
+				if i % 20000 == 0 then task.wait() end
+			end
+			local bytes = table.concat(out)
+			pcall(makeFolder, CONFIG.FolderName)
+			local path = CONFIG.FolderName .. "/logo.png"
+			writeFile(path, bytes)
+			local asset = getAsset(path)
+			if type(asset) ~= "string" or asset == "" then error("no asset") end
+			logoImg.Image = asset
+		end)
+		if ok then
+			tween(logoImg, { ImageTransparency = 0 }, 0.5, Enum.EasingStyle.Quad)
+			tween(logoText, { TextTransparency = 1 }, 0.4, Enum.EasingStyle.Quad)
+		end
+	end)
+	newLabel({ Position = UDim2.fromOffset(58, 11), Size = UDim2.new(1, -130, 0, 18), Text = "R6 Recorder",
+		Font = Enum.Font.GothamBold, TextSize = 15, Parent = header })
+	local subDot = newFrame({ Position = UDim2.fromOffset(58, 35), Size = UDim2.fromOffset(7, 7), BackgroundColor3 = THEME.ok, Parent = header })
+	corner(subDot, 4)
+	local subLabel = newLabel({ Position = UDim2.fromOffset(71, 30), Size = UDim2.new(1, -140, 0, 16),
+		Text = "v9 - ready", TextSize = 11, TextColor3 = THEME.sub, Parent = header })
+
+	local minBtn = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -48, 0.5, 0),
+		Size = UDim2.fromOffset(28, 28) }, "-", THEME.panel2, 18, 14)
+	local closeBtn = makeButton(header, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -14, 0.5, 0),
+		Size = UDim2.fromOffset(28, 28) }, "x", THEME.panel2, 13, 14)
+	closeBtn.hover = Color3.fromRGB(190, 55, 72)
+	M.minBtn, M.closeBtn = minBtn, closeBtn
+
+	local body = newFrame({ Name = "Body", BackgroundTransparency = 1, Position = UDim2.fromOffset(0, H_MIN),
+		Size = UDim2.new(1, 0, 0, H_EXPANDED - H_MIN), Parent = win })
+	local intro = {}
+
+	local function section(props)
+		local p = { BackgroundTransparency = 1, BorderSizePixel = 0, Parent = body }
+		for k, v in pairs(props) do p[k] = v end
+		local s = create("Frame", p)
+		intro[#intro + 1] = s
+		return s
+	end
+
+	local COLS, ROWS = 14, 4
+	local LEVEL = {
+		Color3.fromRGB(24, 40, 50), Color3.fromRGB(20, 92, 112),
+		Color3.fromRGB(34, 160, 190), Color3.fromRGB(150, 246, 255),
+	}
+	local function levelColor(v)
+		v = math.clamp(v, 0, 1)
+		local pos = v * 3
+		local i = math.min(math.floor(pos), 2)
+		return LEVEL[i + 1]:Lerp(LEVEL[i + 2], pos - i)
+	end
+	local cells, hist = {}, {}
+	local statVals, rateLabels = {}, {}
+	local isRec = false
+
+	local recSec = section({ Position = UDim2.fromOffset(10, 8), Size = UDim2.new(1, -20, 0, 50) })
+	local recBtn = makeButton(recSec, { Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4) },
+		"START RECORDING", THEME.accent, 14, 16, DARK)
+	gradient(recBtn.btn, Color3.fromRGB(255, 255, 255), Color3.fromRGB(190, 236, 246), 90)
+	local pulseRing = stroke(recBtn.btn, Color3.new(1, 1, 1), 2, 1)
+	local recDot = newFrame({ AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 20, 0.5, 0),
+		Size = UDim2.fromOffset(12, 12), BackgroundColor3 = DARK, BackgroundTransparency = 0.35, Parent = recBtn.btn })
+	corner(recDot, 6)
+	local recTimer = newLabel({ AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -18, 0.5, 0), Size = UDim2.fromOffset(84, 20),
+		Font = Enum.Font.Code, TextSize = 13, TextColor3 = DARK, TextXAlignment = Enum.TextXAlignment.Right, Parent = recBtn.btn })
+	M.recBtn, M.recTimer = recBtn, recTimer
+
+	do
+		local baseSetColor = recBtn.setColor
+		function recBtn.setColor(c)
+			local recordingNow = (c == THEME.go)
+			local tc = recordingNow and THEME.text or DARK
+			baseSetColor(recordingNow and THEME.rec or THEME.accent)
+			tween(recBtn.btn, { TextColor3 = tc }, 0.3)
+			tween(recTimer, { TextColor3 = tc }, 0.3)
+			tween(recDot, { BackgroundColor3 = tc }, 0.3)
+		end
+	end
+
+	local MODE_LIST = {
+		{ key = "full", name = "Full Record", short = "Full Record" },
+		{ key = "player", name = "Player Animation + Camera", short = "Player + Cam" },
+		{ key = "victim", name = "Victim Animation", short = "Victim Anim" },
+		{ key = "vfx", name = "VFX Only", short = "VFX Only" },
+	}
+	local modeKey = "full"
+	local menuOpen = false
+	local modeSec = section({ Position = UDim2.fromOffset(10, 60), Size = UDim2.new(1, -20, 0, 42) })
+	local modeBtn = makeButton(modeSec, { Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4) },
+		"Mode: Full Record   v", THEME.panel2, 12, 12)
+	stroke(modeBtn.btn, THEME.stroke, 1, 0.4)
+	local victimCard = newCard({ Position = UDim2.new(0.46, 6, 0, 2), Size = UDim2.new(0.54, -8, 1, -4), Visible = false, Parent = modeSec }, THEME.panel2)
+	local victimStroke = victimCard:FindFirstChildOfClass("UIStroke")
+	local victimBox = create("TextBox", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0), Font = Enum.Font.GothamMedium,
+		TextSize = 12, TextColor3 = THEME.text, PlaceholderText = "Victim name / username", PlaceholderColor3 = THEME.sub, Text = "",
+		ClearTextOnFocus = false, TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, Parent = victimCard,
+	})
+	victimBox.Focused:Connect(function() tween(victimStroke, { Color = THEME.accent, Transparency = 0.1 }, 0.2) end)
+	victimBox.FocusLost:Connect(function() tween(victimStroke, { Color = THEME.stroke, Transparency = 0.5 }, 0.3) end)
+
+	local MENU_H = #MODE_LIST * 34 + 12
+	local menuCatcher = create("TextButton", { Name = "MenuCatcher", BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+		Size = UDim2.fromScale(1, 1), ZIndex = 40, Visible = false, Parent = body })
+	local menu = create("CanvasGroup", { Name = "ModeMenu", Position = UDim2.fromOffset(12, 98), Size = UDim2.new(1, -24, 0, MENU_H),
+		BackgroundColor3 = THEME.panel, BorderSizePixel = 0, GroupTransparency = 1, Visible = false, ZIndex = 50, Parent = body })
+	corner(menu, 14)
+	stroke(menu, THEME.accent, 1.2, 0.55)
+
+	local optionRows = {}
+	for i, m in ipairs(MODE_LIST) do
+		local row = create("TextButton", { Position = UDim2.fromOffset(6, 6 + (i - 1) * 34), Size = UDim2.new(1, -12, 0, 30),
+			BackgroundColor3 = THEME.panel2, BackgroundTransparency = 1, AutoButtonColor = false, Text = "", Parent = menu })
+		corner(row, 10)
+		local dot = newFrame({ AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0), Size = UDim2.fromOffset(10, 10),
+			BackgroundColor3 = THEME.stroke, Parent = row })
+		corner(dot, 5)
+		local lbl = newLabel({ Position = UDim2.fromOffset(32, 0), Size = UDim2.new(1, -40, 1, 0), Text = m.name,
+			Font = Enum.Font.GothamMedium, TextSize = 12, Parent = row })
+		row.MouseEnter:Connect(function() tween(row, { BackgroundTransparency = 0.25 }, 0.15) end)
+		row.MouseLeave:Connect(function() tween(row, { BackgroundTransparency = 1 }, 0.25) end)
+		optionRows[i] = { row = row, dot = dot, lbl = lbl, key = m.key }
+	end
+
+	local function openMenu()
+		if menuOpen or not modeBtn.enabled then return end
+		menuOpen = true
+		menuCatcher.Visible = true
+		menu.Visible = true
+		menu.GroupTransparency = 1
+		menu.Position = UDim2.fromOffset(12, 98)
+		tween(menu, { GroupTransparency = 0, Position = UDim2.fromOffset(12, 106) }, 0.4, Enum.EasingStyle.Back)
+		for i, r in ipairs(optionRows) do
+			local y = 6 + (i - 1) * 34
+			r.row.Position = UDim2.fromOffset(-12, y)
+			task.delay(0.04 * i, function()
+				if menuOpen then tween(r.row, { Position = UDim2.fromOffset(6, y) }, 0.45, Enum.EasingStyle.Back) end
+			end)
+		end
+	end
+
+	local function closeMenu()
+		if not menuOpen then return end
+		menuOpen = false
+		menuCatcher.Visible = false
+		tween(menu, { GroupTransparency = 1, Position = UDim2.fromOffset(12, 98) }, 0.22, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		task.delay(0.24, function()
+			if not menuOpen then menu.Visible = false end
+		end)
+	end
+
+	local function refreshMode()
+		local short = "Full Record"
+		for i, m in ipairs(MODE_LIST) do
+			local on = (m.key == modeKey)
+			if on then short = m.short end
+			tween(optionRows[i].dot, { BackgroundColor3 = on and THEME.accent or THEME.stroke }, 0.25)
+			tween(optionRows[i].lbl, { TextColor3 = on and THEME.accent or THEME.text }, 0.25)
+		end
+		modeBtn.setText("Mode: " .. short .. "   v")
+		if modeKey == "victim" then
+			tween(modeBtn.holder, { Size = UDim2.new(0.46, -2, 1, -4) }, 0.45, Enum.EasingStyle.Quint)
+			victimCard.Visible = true
+			victimCard.BackgroundTransparency = 1
+			victimBox.TextTransparency = 1
+			victimStroke.Transparency = 1
+			tween(victimCard, { BackgroundTransparency = 0 }, 0.35)
+			tween(victimBox, { TextTransparency = 0 }, 0.35)
+			tween(victimStroke, { Transparency = 0.5 }, 0.35)
+		else
+			tween(modeBtn.holder, { Size = UDim2.new(1, -4, 1, -4) }, 0.45, Enum.EasingStyle.Quint)
+			tween(victimCard, { BackgroundTransparency = 1 }, 0.25)
+			tween(victimBox, { TextTransparency = 1 }, 0.25)
+			tween(victimStroke, { Transparency = 1 }, 0.25)
+			task.delay(0.28, function()
+				if modeKey ~= "victim" then victimCard.Visible = false end
+			end)
+		end
+	end
+
+	for _, r in ipairs(optionRows) do
+		r.row.Activated:Connect(function()
+			modeKey = r.key
+			refreshMode()
+			closeMenu()
+			if modeKey == "victim" then
+				task.delay(0.45, function()
+					if modeKey == "victim" and modeBtn.enabled then victimBox:CaptureFocus() end
+				end)
+			end
+		end)
+	end
+	modeBtn.onClick(function()
+		if menuOpen then closeMenu() else openMenu() end
+	end)
+	menuCatcher.Activated:Connect(closeMenu)
+	refreshMode()
+
+	local function lockMode(on)
+		modeBtn.setEnabled(not on)
+		victimBox.TextEditable = not on
+		if on then closeMenu() end
+	end
+
+	function M.getMode() return modeKey end
+	function M.getVictim()
+		local t = victimBox.Text:gsub("^%s+", "")
+		t = t:gsub("%s+$", "")
+		return t
+	end
+
+	local heatSec = section({ Position = UDim2.fromOffset(12, 104), Size = UDim2.new(1, -24, 0, 100) })
+	local heatCard = newCard({ Size = UDim2.fromScale(1, 1), Parent = heatSec })
+	badge(heatCard, UDim2.fromOffset(12, 9), 20, THEME.accent)
+	newLabel({ Position = UDim2.fromOffset(40, 9), Size = UDim2.fromOffset(90, 20), Text = "Live Activity",
+		Font = Enum.Font.GothamBold, TextSize = 12, Parent = heatCard })
+	local livePill = newFrame({ Position = UDim2.fromOffset(128, 11), Size = UDim2.fromOffset(40, 16), BackgroundColor3 = THEME.panel2, Parent = heatCard })
+	corner(livePill, 8)
+	local livePillStroke = stroke(livePill, THEME.stroke, 1, 0.3)
+	local liveLabel = newLabel({ Size = UDim2.fromScale(1, 1), Text = "IDLE", Font = Enum.Font.GothamBold, TextSize = 9,
+		TextColor3 = THEME.sub, TextXAlignment = Enum.TextXAlignment.Center, Parent = livePill })
+
+	do
+		local legend = newFrame({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 11), Size = UDim2.fromOffset(180, 16),
+			BackgroundTransparency = 1, Parent = heatCard })
+		local names, widths = { "Low", "Medium", "High", "Best" }, { 34, 50, 36, 36 }
+		local x = 0
+		for i, nm in ipairs(names) do
+			local dot = newFrame({ Position = UDim2.fromOffset(x, 5), Size = UDim2.fromOffset(6, 6), BackgroundColor3 = LEVEL[i], Parent = legend })
+			corner(dot, 3)
+			newLabel({ Position = UDim2.fromOffset(x + 10, 0), Size = UDim2.fromOffset(widths[i] - 10, 16), Text = nm, TextSize = 9,
+				Font = Enum.Font.GothamMedium, TextColor3 = THEME.sub, Parent = legend })
+			x += widths[i] + 8
+		end
+	end
+
+	do
+		local rowNames = { "FRM", "CAM", "VFX", "MDL" }
+		for r = 1, ROWS do
+			newLabel({ Position = UDim2.fromOffset(14, 34 + (r - 1) * 15), Size = UDim2.fromOffset(30, 12), Text = rowNames[r],
+				Font = Enum.Font.GothamMedium, TextSize = 9, TextColor3 = THEME.sub, Parent = heatCard })
+		end
+		local grid = newFrame({ Position = UDim2.fromOffset(46, 34), Size = UDim2.new(1, -60, 0, 57), BackgroundTransparency = 1, Parent = heatCard })
+		local gl = Instance.new("UIGridLayout")
+		gl.CellSize = UDim2.new(1 / COLS, -3, 0, 12)
+		gl.CellPadding = UDim2.fromOffset(3, 3)
+		gl.SortOrder = Enum.SortOrder.LayoutOrder
+		gl.FillDirection = Enum.FillDirection.Horizontal
+		gl.Parent = grid
+		for r = 1, ROWS do
+			cells[r], hist[r] = {}, {}
+			for c = 1, COLS do
+				hist[r][c] = 0
+				local cell = newFrame({ LayoutOrder = (r - 1) * COLS + c, BackgroundColor3 = LEVEL[1], Parent = grid })
+				corner(cell, 4)
+				cells[r][c] = cell
+			end
+		end
+	end
+
+	local statSec = section({ Position = UDim2.fromOffset(12, 212), Size = UDim2.new(1, -24, 0, 56) })
+	local statRow = newFrame({ BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = statSec })
+	listLayout(statRow, Enum.FillDirection.Horizontal, 8)
+	local function makeStat(order, caption, tint)
+		local card = newCard({ LayoutOrder = order, Size = UDim2.new(0.25, -6, 1, 0), ClipsDescendants = true, Parent = statRow }, THEME.panel2)
+		local cardStroke = card:FindFirstChildOfClass("UIStroke")
+		badge(card, UDim2.new(1, -24, 0, 7), 14, tint)
+		newLabel({ Position = UDim2.fromOffset(12, 7), Size = UDim2.new(1, -34, 0, 12), Text = caption, TextSize = 10,
+			Font = Enum.Font.GothamMedium, TextColor3 = THEME.sub, Parent = card })
+		local value = newLabel({ Position = UDim2.fromOffset(12, 19), Size = UDim2.new(1, -14, 0, 22), Text = "0",
+			Font = Enum.Font.GothamBold, TextSize = 18, Parent = card })
+		local rate = newLabel({ Position = UDim2.fromOffset(12, 41), Size = UDim2.new(1, -14, 0, 12), Text = "total", TextSize = 9,
+			Font = Enum.Font.GothamMedium, TextColor3 = THEME.accent, Parent = card })
+		card.MouseEnter:Connect(function()
+			tween(cardStroke, { Transparency = 0.05, Color = THEME.accent }, 0.2)
+			tween(card, { BackgroundColor3 = lighten(THEME.panel2, 0.05) }, 0.2)
+		end)
+		card.MouseLeave:Connect(function()
+			tween(cardStroke, { Transparency = 0.5, Color = THEME.stroke }, 0.3)
+			tween(card, { BackgroundColor3 = THEME.panel2 }, 0.3)
+		end)
+		statVals[order], rateLabels[order] = value, rate
+		return value
+	end
+	makeStat(1, "FRAMES", THEME.accent2)
+	makeStat(2, "CAMERA", THEME.ok)
+	makeStat(3, "VFX", THEME.warn)
+	makeStat(4, "MODELS", THEME.model)
+
+	local statusSec = section({ Position = UDim2.fromOffset(12, 276), Size = UDim2.new(1, -24, 0, 58) })
+	local statusPanel = newCard({ Size = UDim2.fromScale(1, 1), ClipsDescendants = true, Parent = statusSec })
+	local statusBar = newFrame({ Size = UDim2.new(0, 3, 1, 0), BackgroundColor3 = THEME.ok, Parent = statusPanel })
+	local statusScroll = create("ScrollingFrame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(16, 6), Size = UDim2.new(1, -96, 1, -18),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2,
+		ScrollBarImageColor3 = THEME.accent, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = statusPanel,
+	})
+	local statusLabel = newLabel({ Size = UDim2.new(1, -6, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, Font = Enum.Font.Code,
+		TextSize = 11, TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top, TextColor3 = THEME.ok,
+		Text = "Ready. Press START, perform the move, press STOP.", Parent = statusScroll })
+	local timePill = newFrame({ AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -12, 0, 8), Size = UDim2.fromOffset(62, 20),
+		BackgroundColor3 = THEME.panel2, Parent = statusPanel })
+	corner(timePill, 10)
+	local timeLabel = newLabel({ Size = UDim2.fromScale(1, 1), Text = "0.0s", Font = Enum.Font.Code, TextSize = 11,
+		TextColor3 = THEME.accent, TextXAlignment = Enum.TextXAlignment.Center, Parent = timePill })
+	local progTrack = newFrame({ AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -7), Size = UDim2.new(1, -30, 0, 4),
+		BackgroundColor3 = THEME.panel2, BackgroundTransparency = 1, Parent = statusPanel })
+	corner(progTrack, 2)
+	local progFill = newFrame({ Size = UDim2.fromScale(0, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1, Parent = progTrack })
+	corner(progFill, 2)
+	gradient(progFill, THEME.accent, THEME.accent2, 0)
+
+	local actSec = section({ Position = UDim2.fromOffset(10, 342), Size = UDim2.new(1, -20, 0, 36) })
+	local actRow = newFrame({ BackgroundTransparency = 1, Position = UDim2.fromOffset(2, 2), Size = UDim2.new(1, -4, 1, -4), Parent = actSec })
+	listLayout(actRow, Enum.FillDirection.Horizontal, 8)
+	local replayBtn = makeButton(actRow, { LayoutOrder = 1, Size = UDim2.new(0.25, -6, 1, 0) }, "REPLAY (R)", THEME.accent, 11, 12, DARK)
+	gradient(replayBtn.btn, Color3.fromRGB(255, 255, 255), Color3.fromRGB(186, 234, 244), 0)
+	local copyListBtn = makeButton(actRow, { LayoutOrder = 2, Size = UDim2.new(0.25, -6, 1, 0) }, "COPY LIST", THEME.panel2, 11, 12)
+	local copyAnimBtn = makeButton(actRow, { LayoutOrder = 3, Size = UDim2.new(0.25, -6, 1, 0) }, "COPY ANIM", THEME.panel2, 11, 12)
+	local copyBtn = makeButton(actRow, { LayoutOrder = 4, Size = UDim2.new(0.25, -6, 1, 0) }, "COPY ALL", THEME.panel2, 11, 12)
+	M.replayBtn, M.copyListBtn, M.copyAnimBtn, M.copyBtn = replayBtn, copyListBtn, copyAnimBtn, copyBtn
+
+	local swSec = section({ Position = UDim2.fromOffset(12, 386), Size = UDim2.new(1, -24, 0, 42) })
+	local function makeSwitch(pos, title, subtitle)
+		local row = newCard({ Position = pos, Size = UDim2.new(0.5, -4, 1, 0), Parent = swSec }, THEME.panel2)
+		newLabel({ Position = UDim2.fromOffset(12, 5), Size = UDim2.new(1, -62, 0, 18), Text = title,
+			Font = Enum.Font.GothamBold, TextSize = 11, Parent = row })
+		newLabel({ Position = UDim2.fromOffset(12, 22), Size = UDim2.new(1, -62, 0, 14), Text = subtitle,
+			TextSize = 9, TextColor3 = THEME.sub, Parent = row })
+		local track = create("TextButton", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(38, 20),
+			BackgroundColor3 = THEME.stroke, BorderSizePixel = 0, AutoButtonColor = false, Text = "", Parent = row,
+		})
+		corner(track, 10)
+		local knob = newFrame({ AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 3, 0.5, 0), Size = UDim2.fromOffset(14, 14),
+			BackgroundColor3 = Color3.new(1, 1, 1), Parent = track })
+		corner(knob, 7)
+		local knobScale = Instance.new("UIScale")
+		knobScale.Parent = knob
+
+		local sw = { on = true, onChange = nil }
+		function sw.set(on, silent)
+			sw.on = on and true or false
+			tween(track, { BackgroundColor3 = sw.on and THEME.accent2 or THEME.stroke }, 0.25)
+			tween(knob, { Position = sw.on and UDim2.new(1, -17, 0.5, 0) or UDim2.new(0, 3, 0.5, 0) }, 0.35, Enum.EasingStyle.Back)
+			if not silent and sw.onChange then sw.onChange(sw.on) end
+		end
+		track.MouseButton1Down:Connect(function() tween(knobScale, { Scale = 1.2 }, 0.1) end)
+		track.MouseButton1Up:Connect(function() tween(knobScale, { Scale = 1 }, 0.35, Enum.EasingStyle.Back) end)
+		track.MouseLeave:Connect(function() tween(knobScale, { Scale = 1 }, 0.2) end)
+		track.Activated:Connect(function() sw.set(not sw.on) end)
+		sw.set(true, true)
+		return sw
+	end
+
+	local vfxSwitch = makeSwitch(UDim2.fromOffset(0, 0), "Replay VFX", "particles, trails, sounds")
+	M.vfxOn = true
+	M.onVfxToggle = nil
+	vfxSwitch.onChange = function(on)
+		M.vfxOn = on
+		if M.onVfxToggle then M.onVfxToggle(on) end
+	end
+	function M.setVfxOn(on, silent)
+		vfxSwitch.set(on, silent)
+		M.vfxOn = vfxSwitch.on
+	end
+	M.setVfxOn(true, true)
+
+	local modelSwitch = makeSwitch(UDim2.new(0.5, 4, 0, 0), "Record Models", "models + spawned parts")
+	M.modelsOn = true
+	M.onModelsToggle = nil
+	modelSwitch.onChange = function(on)
+		M.modelsOn = on
+		if M.onModelsToggle then M.onModelsToggle(on) end
+	end
+	function M.setModelsOn(on, silent)
+		modelSwitch.set(on, silent)
+		M.modelsOn = modelSwitch.on
+	end
+	M.setModelsOn(true, true)
+
+	local repSec = section({ Position = UDim2.fromOffset(12, 436), Size = UDim2.new(1, -24, 0, 30) })
+	local repBar = newCard({ Size = UDim2.fromScale(1, 1), Parent = repSec })
+	newLabel({ Position = UDim2.fromOffset(14, 0), Size = UDim2.new(0, 70, 1, 0), Text = "REPORT", Font = Enum.Font.GothamBold,
+		TextSize = 11, TextColor3 = THEME.sub, Parent = repBar })
+	local toggleBtn = makeButton(repBar, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0), Size = UDim2.fromOffset(54, 22) },
+		"SHOW", THEME.panel2, 10, 11)
+	local nextBtn = makeButton(repBar, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -66, 0.5, 0), Size = UDim2.fromOffset(24, 22) },
+		">", THEME.panel2, 14, 11)
+	local pageLabel = newLabel({ AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -94, 0.5, 0), Size = UDim2.fromOffset(56, 22),
+		Text = "0 / 0", Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = THEME.sub, TextXAlignment = Enum.TextXAlignment.Center, Parent = repBar })
+	local prevBtn = makeButton(repBar, { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -154, 0.5, 0), Size = UDim2.fromOffset(24, 22) },
+		"<", THEME.panel2, 14, 11)
+
+	local viewPanel = newCard({ Position = UDim2.fromOffset(12, 474), Size = UDim2.new(1, -24, 0, 136), Visible = false, Parent = body })
+	local viewScroll = create("ScrollingFrame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.fromOffset(8, 8), Size = UDim2.new(1, -16, 1, -16),
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
+		ScrollBarImageColor3 = THEME.accent, ScrollingDirection = Enum.ScrollingDirection.Y, Parent = viewPanel,
+	})
+	local viewer = create("TextBox", {
+		Size = UDim2.new(1, -8, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, MultiLine = true,
+		TextEditable = false, ClearTextOnFocus = false, TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top, Font = Enum.Font.Code, TextSize = 11, TextColor3 = Color3.fromRGB(212, 234, 240),
+		Text = "The full report appears here after you stop recording (use the arrows to page through it, select text to copy).",
+		Parent = viewScroll,
+	})
+
+	local toastFrame = newFrame({ Name = "Toast", AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, 80),
+		Size = UDim2.fromOffset(0, 40), AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = THEME.panel, Parent = screenGui })
+	corner(toastFrame, 20)
+	local toastStroke = stroke(toastFrame, THEME.ok, 1.5, 0.25)
+	do
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 34)
+		pad.PaddingRight = UDim.new(0, 18)
+		pad.Parent = toastFrame
+	end
+	local toastDot = newFrame({ AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, -20, 0.5, 0), Size = UDim2.fromOffset(8, 8),
+		BackgroundColor3 = THEME.ok, Parent = toastFrame })
+	corner(toastDot, 4)
+	local toastLabel = newLabel({ AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.fromOffset(0, 40), Font = Enum.Font.GothamMedium,
+		TextSize = 13, TextXAlignment = Enum.TextXAlignment.Center, Parent = toastFrame })
+
+	local minimized, reportOpen = false, false
+	local sizeTween = nil
+	local toastToken = 0
+	local pulseTweens = {}
+	local reportPages, reportPageIdx = {}, 1
+
+	function M.notify(text, kind)
+		toastToken += 1
+		local my = toastToken
+		local color = (kind == "warn" and THEME.warn) or (kind == "err" and THEME.rec) or THEME.ok
+		toastLabel.Text = text
+		toastStroke.Color = color
+		toastDot.BackgroundColor3 = color
+		toastFrame.Position = UDim2.new(0.5, 0, 1, 80)
+		tween(toastFrame, { Position = UDim2.new(0.5, 0, 1, -24) }, 0.55, Enum.EasingStyle.Back)
+		task.delay(3, function()
+			if toastToken == my then
+				tween(toastFrame, { Position = UDim2.new(0.5, 0, 1, 80) }, 0.4, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+			end
+		end)
+	end
+
+	function M.setStatus(text, color, quiet)
+		statusLabel.Text = text
+		statusLabel.TextColor3 = color or THEME.ok
+		tween(statusBar, { BackgroundColor3 = color or THEME.ok }, 0.3)
+		if not quiet then
+			statusScroll.CanvasPosition = Vector2.new(0, 0)
+			statusLabel.TextTransparency = 0.7
+			tween(statusLabel, { TextTransparency = 0 }, 0.3)
+		end
+	end
+
+	function M.setSubtitle(text, color)
+		subLabel.Text = text
+		subLabel.TextColor3 = color or THEME.sub
+		tween(subDot, { BackgroundColor3 = color or THEME.ok }, 0.3)
+	end
+
+	local lastPushT, lastVals = 0, { 0, 0, 0, 0 }
+	local function resetHeat()
+		lastPushT = 0
+		lastVals = { 0, 0, 0, 0 }
+		for r = 1, ROWS do
+			for c = 1, COLS do
+				hist[r][c] = 0
+				cells[r][c].BackgroundColor3 = LEVEL[1]
+			end
+			rateLabels[r].Text = "+0/s"
+		end
+	end
+
+	local function pushHeat(t, vals)
+		local dt = t - lastPushT
+		if t < lastPushT then
+			lastPushT = 0
+			return
+		end
+		if dt < 0.5 then return end
+		lastPushT = t
+		for r = 1, ROWS do
+			local delta = math.max(0, vals[r] - lastVals[r])
+			lastVals[r] = vals[r]
+			local rate = delta / dt
+			local v
+			if r <= 2 then
+				v = math.sqrt(math.clamp(rate / 70, 0, 1))
+			else
+				v = delta > 0 and math.clamp(0.5 + delta * 0.15, 0, 1) or 0
+			end
+			local row = hist[r]
+			for c = 1, COLS - 1 do row[c] = row[c + 1] end
+			row[COLS] = v
+			for c = 1, COLS do
+				tween(cells[r][c], { BackgroundColor3 = levelColor(row[c]) }, 0.3)
+			end
+			rateLabels[r].Text = ("+%s/s"):format(rate >= 10 and tostring(math.floor(rate + 0.5)) or ("%.1f"):format(rate))
+		end
+	end
+
+	local function setVal(i, text, flash)
+		local lb = statVals[i]
+		if lb.Text == text then return end
+		lb.Text = text
+		if flash then
+			lb.TextColor3 = THEME.accent
+			lb.Position = UDim2.fromOffset(12, 14)
+			tween(lb, { TextColor3 = THEME.text }, 0.6)
+			tween(lb, { Position = UDim2.fromOffset(12, 19) }, 0.5, Enum.EasingStyle.Back)
+		end
+	end
+
+	function M.setStats(t, f, c, v, m)
+		m = m or 0
+		timeLabel.Text = ("%.1fs"):format(t)
+		setVal(1, tostring(f), false)
+		setVal(2, tostring(c), false)
+		setVal(3, tostring(v), true)
+		setVal(4, tostring(m), true)
+		if isRec then pushHeat(t, { f, c, v, m }) end
+	end
+
+	function M.setProgress(f)
+		if f == nil then
+			tween(progTrack, { BackgroundTransparency = 1 }, 0.35)
+			tween(progFill, { BackgroundTransparency = 1 }, 0.35)
+			task.delay(0.5, function() progFill.Size = UDim2.fromScale(0, 1) end)
+			return
+		end
+		tween(progTrack, { BackgroundTransparency = 0 }, 0.2)
+		tween(progFill, { BackgroundTransparency = 0, Size = UDim2.fromScale(math.clamp(f, 0, 1), 1) }, 0.3, Enum.EasingStyle.Quad)
+	end
+
+	function M.setPulse(on)
+		for _, tw in ipairs(pulseTweens) do tw:Cancel() end
+		table.clear(pulseTweens)
+		isRec = on and true or false
+		lockMode(isRec)
+		if isRec then
+			resetHeat()
+		else
+			for r = 1, ROWS do rateLabels[r].Text = "total" end
+		end
+		liveLabel.Text = isRec and "LIVE" or "IDLE"
+		tween(liveLabel, { TextColor3 = isRec and THEME.rec or THEME.sub }, 0.3)
+		tween(livePillStroke, { Color = isRec and THEME.rec or THEME.stroke }, 0.3)
+		recDot.BackgroundTransparency = on and 0 or 0.35
+		pulseRing.Transparency = 1
+		if on then
+			local info = TweenInfo.new(0.8, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+			local a = TweenService:Create(recDot, info, { BackgroundTransparency = 0.8 })
+			pulseRing.Transparency = 0.8
+			local b = TweenService:Create(pulseRing, info, { Transparency = 0.3 })
+			local c = TweenService:Create(livePillStroke, info, { Transparency = 0.9 })
+			a:Play()
+			b:Play()
+			c:Play()
+			pulseTweens[1], pulseTweens[2], pulseTweens[3] = a, b, c
+		else
+			livePillStroke.Transparency = 0.3
+		end
+	end
+
+	function M.setActionsEnabled(replayOn, copyOn)
+		replayBtn.setEnabled(replayOn)
+		copyListBtn.setEnabled(copyOn)
+		copyAnimBtn.setEnabled(copyOn)
+		copyBtn.setEnabled(copyOn)
+	end
+
+	local function currentSize()
+		if minimized then return UDim2.fromOffset(MINI_W, H_MIN) end
+		return UDim2.fromOffset(WIN_W, reportOpen and H_EXPANDED or H_COLLAPSED)
+	end
+
+	local function applySize(style)
+		if sizeTween then sizeTween:Cancel() end
+		sizeTween = tween(win, { Size = currentSize() }, 0.5, style or Enum.EasingStyle.Quint)
+		return sizeTween
+	end
+
+	local function setMinimized(on)
+		minimized = on
+		closeMenu()
+		minBtn.setText(on and "+" or "-")
+		if on then
+			local tw = applySize()
+			tw.Completed:Connect(function(state)
+				if minimized and state == Enum.PlaybackState.Completed then body.Visible = false end
+			end)
+		else
+			body.Visible = true
+			applySize(Enum.EasingStyle.Back)
+		end
+	end
+
+	function M.setReportOpen(on)
+		reportOpen = on
+		toggleBtn.setText(on and "HIDE" or "SHOW")
+		if on then
+			viewPanel.Visible = true
+		else
+			task.delay(0.5, function()
+				if not reportOpen then viewPanel.Visible = false end
+			end)
+		end
+		if not minimized then applySize() end
+	end
+
+	local function showPage(i)
+		if #reportPages == 0 then
+			pageLabel.Text = "0 / 0"
+			return
+		end
+		reportPageIdx = math.clamp(i, 1, #reportPages)
+		viewer.Text = reportPages[reportPageIdx]
+		pageLabel.Text = ("%d / %d"):format(reportPageIdx, #reportPages)
+		viewScroll.CanvasPosition = Vector2.new(0, 0)
+		viewer.TextTransparency = 0.8
+		tween(viewer, { TextTransparency = 0 }, 0.3)
+	end
+
+	function M.setReport(text)
+		reportPages = paginate((fitText(text, CONFIG.ScreenReportLimit, "...(on-screen view is cut here - use COPY ALL or the saved files for the rest)")), CONFIG.ScreenPageChars)
+		showPage(1)
+	end
+
+	local function calcScale()
+		local cam = Workspace.CurrentCamera
+		if not cam then return 1 end
+		local vp = cam.ViewportSize
+		return 0.85 * math.max(0.5, math.min(1, (vp.X - 24) / WIN_W, (vp.Y - 70) / H_EXPANDED))
+	end
+
+	function M.fitScale()
+		winScale.Scale = calcScale()
+	end
+
+	prevBtn.onClick(function() showPage(reportPageIdx - 1) end)
+	nextBtn.onClick(function() showPage(reportPageIdx + 1) end)
+	toggleBtn.onClick(function() M.setReportOpen(not reportOpen) end)
+	minBtn.onClick(function() setMinimized(not minimized) end)
+
+	do
+		local dragging, dragStart, startPos, dragInput = false, nil, nil, nil
+		header.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startPos = win.Position
+				input.Changed:Connect(function()
+					if input.UserInputState == Enum.UserInputState.End then dragging = false end
+				end)
+			end
+		end)
+		header.InputChanged:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+				dragInput = input
+			end
+		end)
+		table.insert(M.conns, UserInputService.InputChanged:Connect(function(input)
+			if dragging and input == dragInput then
+				local delta = input.Position - dragStart
+				local nx = startPos.X.Offset + delta.X
+				local ny = startPos.Y.Offset + delta.Y
+				local area = screenGui.AbsoluteSize
+				local size = win.AbsoluteSize
+				nx = math.clamp(nx, 0, math.max(0, area.X - size.X))
+				ny = math.clamp(ny, 0, math.max(0, area.Y - size.Y))
+				tween(win, { Position = UDim2.fromOffset(nx, ny) }, 0.08, Enum.EasingStyle.Quad)
+			end
+		end))
+	end
+
+	if Workspace.CurrentCamera then
+		table.insert(M.conns, Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(M.fitScale))
+	end
+
+	function M.open()
+		local target = calcScale()
+		winScale.Scale = target * 0.92
+		tween(winScale, { Scale = target }, 0.8, Enum.EasingStyle.Back)
+		tween(win, { BackgroundTransparency = 0 }, 0.5, Enum.EasingStyle.Quad)
+		sizeTween = tween(win, { Size = UDim2.fromOffset(WIN_W, H_COLLAPSED), Position = UDim2.fromOffset(16, 16) }, 0.9, Enum.EasingStyle.Back)
+		for i, sec in ipairs(intro) do
+			local final = sec.Position
+			sec.Position = final + UDim2.fromOffset(0, 24)
+			task.delay(0.1 + i * 0.07, function()
+				if sec.Parent then
+					tween(sec, { Position = final }, 0.7, Enum.EasingStyle.Quint)
+				end
+			end)
+		end
+		for r = 1, ROWS do
+			for c = 1, COLS do
+				local cell = cells[r][c]
+				task.delay(0.55 + (r + c) * 0.035, function()
+					if not cell.Parent then return end
+					tween(cell, { BackgroundColor3 = LEVEL[3] }, 0.18)
+					task.delay(0.2, function()
+						if cell.Parent then tween(cell, { BackgroundColor3 = levelColor(hist[r][c]) }, 0.5) end
+					end)
+				end)
+			end
+		end
+	end
+
+	function M.close()
+		tween(win, { BackgroundTransparency = 1 }, 0.3, Enum.EasingStyle.Quad)
+		tween(win, { Size = UDim2.fromOffset(WIN_W, H_MIN) }, 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+		tween(winScale, { Scale = winScale.Scale * 0.94 }, 0.3, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+	end
+
+	return M
+end)()
+
+local THEME = UI.THEME
+local notify, setStatus, setSubtitle, setStats = UI.notify, UI.setStatus, UI.setSubtitle, UI.setStats
+local setProgress, setPulse, setActionsEnabled, setReport = UI.setProgress, UI.setPulse, UI.setActionsEnabled, UI.setReport
+local setReportOpen = UI.setReportOpen
+local recBtn, recTimer = UI.recBtn, UI.recTimer
+
+local gconns = {}
+local function gconnect(signal, fn)
+	local c = signal:Connect(fn)
+	gconns[#gconns + 1] = c
+	return c
+end
+
+local recording, finalizing = false, false
+local startClock = 0
+local startRootCF = CFrame.new()
+local frames, camSamples = {}, {}
+local frameStride, frameCounter, camStride, camCounter = 1, 0, 1, 0
+local vfxList, vfxByInst, partRecs, fxRecs, watchRecs = {}, {}, {}, {}, {}
+local modelList, modelByInst = {}, {}
+local effectPartCount, cloneCount, capNotified = 0, 0, false
+local assets, assetOrder = {}, {}
+local animEvents, activeTracks = {}, {}
+local scriptsFound = {}
+local camStart = {}
+local conns = {}
+local recent = {}
+local lastHud = 0
+local lastSession, lastReport, lastList, lastAnimCode = nil, nil, nil, nil
+local testClone = nil
+local queue, qHead, qTail = {}, 1, 0
+
+local REC = { pose = true, cam = true, vfx = true, models = true, tracks = true, target = nil, mode = "full",
+	label = "Full Record", prefix = "R6_Recorded_", victim = nil }
+local MODES = {
+	full = { label = "Full Record", prefix = "R6_Recorded_", pose = true, cam = true, vfx = true, models = true },
+	player = { label = "Player + Camera", prefix = "R6_Player_", pose = true, cam = true, vfx = false, models = false },
+	victim = { label = "Victim Animation", prefix = "R6_Victim_", pose = true, cam = false, vfx = false, models = false },
+	vfx = { label = "VFX Only", prefix = "R6_VFX_", pose = false, cam = false, vfx = true, models = false },
+}
+function MODES.find(text)
+	local q = text:lower()
+	local function score(n)
+		n = n:lower()
+		if n == q then return 3 end
+		if n:sub(1, #q) == q then return 2 end
+		if n:find(q, 1, true) then return 1 end
+		return 0
+	end
+	local best, bestScore = nil, 0
+	for _, plr in ipairs(Players:GetPlayers()) do
+		local ch = plr.Character
+		if ch then
+			local sc = math.max(score(plr.Name), score(plr.DisplayName))
+			if sc > bestScore then best, bestScore = ch, sc end
+		end
+	end
+	if bestScore < 3 then
+		local list = Workspace:GetDescendants()
+		for i = 1, #list do
+			local d = list[i]
+			if d:IsA("Model") and d.Name ~= "R6TestClone" and d:FindFirstChildOfClass("Humanoid") then
+				local sc = score(d.Name)
+				if sc > bestScore then best, bestScore = d, sc end
+			end
+		end
+	end
+	if not best then return nil, "Victim not found: " .. text end
+	local hum = best:FindFirstChildOfClass("Humanoid")
+	if not (hum and hum.RigType == Enum.HumanoidRigType.R6 and best:FindFirstChild("Torso") and best:FindFirstChild("HumanoidRootPart")) then
+		return nil, best.Name .. " is not an R6 rig"
+	end
+	return best
+end
+
+local startRecording, stopRecording
+
+local function now() return os.clock() - startClock end
+local function getRoot() return character and character:FindFirstChild("HumanoidRootPart") end
+
+local function cameraMeta()
+	local cam = Workspace.CurrentCamera
+	if not cam then return {} end
+	return {
+		type = tostring(cam.CameraType),
+		subject = cam.CameraSubject and cam.CameraSubject:GetFullName() or "none",
+		fov = rnd(cam.FieldOfView),
+	}
+end
+
+local function refreshHud(force)
+	if not recording then return end
+	local c = os.clock()
+	if not force and c - lastHud < 0.15 then return end
+	lastHud = c
+	local t = now()
+	setStats(t, #frames, #camSamples, #vfxList, #modelList)
+	recTimer.Text = fmtClock(t)
+	setSubtitle("REC " .. fmtClock(t), THEME.rec)
+	if #recent == 0 then
+		setStatus("Recording... perform your move, then press STOP.", THEME.ok, true)
+	else
+		setStatus(table.concat(recent, "\n"), THEME.ok, true)
+	end
+end
+
+local function qReset()
+	queue, qHead, qTail = {}, 1, 0
+end
+
+local CAP = (function()
+	local C = {}
+	C.emitHook = false
+
+	local function addAsset(raw, kind, label)
+		if type(raw) ~= "string" or raw == "" then return end
+		local a = assets[raw]
+		if not a then
+			a = { kind = kind, users = {}, userList = {} }
+			assets[raw] = a
+			table.insert(assetOrder, raw)
+		end
+		if not a.users[label] then
+			a.users[label] = true
+			table.insert(a.userList, label)
+		end
+	end
+
+	local function collectAssets(propTable, className, label, list)
+		for k, v in pairs(propTable) do
+			if ASSET_PROPS[k] and type(v) == "string" and v ~= "" then
+				addAsset(v, className .. "." .. k, label)
+				if list and not table.find(list, v) then table.insert(list, v) end
+			end
+		end
+	end
+
+	local function logEvent(rec, t, kind, detail)
+		if #rec.events >= CONFIG.MaxEventsPerVFX then return end
+		rec.events[#rec.events + 1] = { t = rnd(t), kind = kind, detail = detail or "" }
+		local line = ("%.2fs #%d %s %s"):format(t, rec.id, kind, rec.name)
+		recent[#recent + 1] = line
+		if #recent > 2 then table.remove(recent, 1) end
+		refreshHud(false)
+	end
+
+	local function belongsToOtherPlayer(inst)
+		local model = inst:FindFirstAncestorOfClass("Model")
+		while model do
+			local plr = Players:GetPlayerFromCharacter(model)
+			if plr and plr ~= player then return true end
+			model = model:FindFirstAncestorOfClass("Model")
+		end
+		return false
+	end
+
+	local modelCapNotified = false
+	local modelCursor = 1
+
+	local function insideTrackedModel(inst)
+		local a = inst.Parent
+		while a and a ~= Workspace do
+			if modelByInst[a] then return true end
+			a = a.Parent
+		end
+		return false
+	end
+
+	local function insideReplay(inst)
+		local a = inst
+		while a and a ~= Workspace do
+			if a.Name == "R6VFXReplay" or a.Name == "R6TestClone" then return true end
+			a = a.Parent
+		end
+		return false
+	end
+
+	local function hasModelAncestor(inst)
+		local a = inst.Parent
+		while a and a ~= Workspace do
+			if a:IsA("Model") or a:IsA("Tool") or a:IsA("Accessory") then return true end
+			a = a.Parent
+		end
+		return false
+	end
+
+	local function modelPos(inst)
+		local ok, cf = pcall(function() return inst:GetPivot() end)
+		if ok and cf then return cf.Position end
+		return nil
+	end
+
+	local function modelAllowed(inst, root)
+		if modelByInst[inst] or #modelList >= CONFIG.MaxModels then return false end
+		if inst:IsA("Terrain") then return false end
+		if inst == character or inst:IsDescendantOf(character) then return false end
+		if not inst:IsDescendantOf(Workspace) then return false end
+		local cam = Workspace.CurrentCamera
+		if cam and inst:IsDescendantOf(cam) then return false end
+		if insideReplay(inst) or insideTrackedModel(inst) then return false end
+		if not inst:IsA("BasePart") and not CONFIG.IncludeHumanoidModels and inst:FindFirstChildOfClass("Humanoid") then
+			return false
+		end
+		if not CONFIG.IncludeOtherPlayers and belongsToOtherPlayer(inst) then return false end
+		local pos = modelPos(inst)
+		return pos ~= nil and (pos - root.Position).Magnitude <= CONFIG.ModelRadius
+	end
+
+	local function looseAllowed(inst)
+		if not CONFIG.RecordLooseParts or not inst:IsA("BasePart") then return false end
+		if inst.Transparency >= 1 and #inst:GetChildren() == 0 then return false end
+		if inst:FindFirstAncestorOfClass("Tool") or inst:FindFirstAncestorOfClass("Accessory") then return false end
+		return not hasModelAncestor(inst)
+	end
+
+	local function logModelEvent(rec, t, kind, detail)
+		rec.events[#rec.events + 1] = { t = rnd(t), kind = kind, detail = detail or "" }
+		local line = ("%.2fs M#%d %s %s"):format(t, rec.id, kind, rec.name)
+		recent[#recent + 1] = line
+		if #recent > 2 then table.remove(recent, 1) end
+		refreshHud(false)
+	end
+
+	local function makeModelClone(rec)
+		local inst = rec.inst
+		local prev = inst.Archivable
+		pcall(function() inst.Archivable = true end)
+		for _, d in ipairs(inst:GetDescendants()) do
+			pcall(function() d.Archivable = true end)
+		end
+		local ok, c = pcall(function() return inst:Clone() end)
+		pcall(function() inst.Archivable = prev end)
+		if not ok or not c then return nil end
+		for _, d in ipairs(c:GetDescendants()) do
+			if d:IsA("BaseScript") then
+				d:Destroy()
+			elseif d:IsA("Sound") then
+				d.Playing = false
+			end
+		end
+		if c:IsA("BasePart") then c.Anchored = true end
+		c.Name = ("MODEL%03d_%s_%s"):format(rec.id, rec.class, rec.name)
+		return c
+	end
+
+	local function collectModelAssets(rec)
+		local label = ("M#%d %s"):format(rec.id, rec.name)
+		local function scan(d)
+			if d:IsA("BasePart") then
+				collectAssets(readProps(d, { "MeshId", "TextureID" }), d.ClassName, label, rec.assetIds)
+			else
+				local list = CHILD_PROPS[d.ClassName]
+				if list then collectAssets(readProps(d, list), d.ClassName, label, rec.assetIds) end
+			end
+			if d:IsA("LuaSourceContainer") then
+				scriptsFound[#scriptsFound + 1] = { model = rec.id, name = d.Name, class = d.ClassName, path = d:GetFullName() }
+			end
+		end
+		scan(rec.inst)
+		local list = rec.inst:GetDescendants()
+		for i = 1, math.min(#list, 3000) do scan(list[i]) end
+	end
+
+	local function registerModel(inst, t, baseline, root)
+		if modelByInst[inst] then return false end
+		if #modelList >= CONFIG.MaxModels then
+			if not modelCapNotified then
+				modelCapNotified = true
+				notify(("Model limit reached (%d) - raise CONFIG.MaxModels if you need more"):format(CONFIG.MaxModels), "warn")
+			end
+			return false
+		end
+		local isPart = inst:IsA("BasePart")
+		local partsList = {}
+		if isPart then
+			partsList[1] = inst
+		else
+			for _, d in ipairs(inst:GetDescendants()) do
+				if d:IsA("BasePart") then
+					partsList[#partsList + 1] = d
+					if #partsList > CONFIG.MaxModelParts then return false end
+				end
+			end
+		end
+		if #partsList == 0 then return false end
+		local ref = isPart and inst or inst.PrimaryPart or partsList[1]
+
+		local rec = {
+			id = #modelList + 1, inst = inst, ref = ref, class = inst.ClassName, name = inst.Name, isPart = isPart,
+			origin = baseline and "present_at_start" or "spawned", path = inst:GetFullName(), start = t,
+			events = {}, samples = {}, subs = {}, assetIds = {}, partCount = #partsList,
+			host = { label = "world", parent = inst.Parent and inst.Parent:GetFullName() or "nil" },
+			refPath = relPath(ref, inst),
+		}
+		local okS, sz = pcall(function()
+			if isPart then return inst.Size end
+			return inst:GetExtentsSize()
+		end)
+		rec.size = okS and sz or Vector3.new()
+		rec.label = ("M#%d %s"):format(rec.id, rec.name)
+		modelByInst[inst] = rec
+		table.insert(modelList, rec)
+
+		local refCF = ref.CFrame
+		local rel0 = root.CFrame:ToObjectSpace(refCF)
+		rec.lastRel = rel0
+		rec.rel0 = rel0
+		rec.samples[1] = { t = t, cf = rel0, w = refCF }
+
+		for i = 1, math.min(#partsList, CONFIG.ModelSubParts) do
+			local part = partsList[i]
+			local rel = refCF:ToObjectSpace(part.CFrame)
+			local size, tr, col = part.Size, part.Transparency, part.Color
+			local sub = {
+				inst = part, name = part.Name, path = relPath(part, inst),
+				last = { rel = rel, size = size, tr = tr, col = col },
+				samples = { { t = t, cf = rel, size = size, tr = tr, col = col } },
+			}
+			rec.subs[#rec.subs + 1] = sub
+		end
+
+		rec.clone = makeModelClone(rec)
+		collectModelAssets(rec)
+
+		for _, vr in ipairs(vfxList) do
+			if not vr.hostRecId and not vr.hostModelId and vr.inst ~= inst and vr.inst:IsDescendantOf(inst) then
+				vr.hostModelId = rec.id
+				vr.hostPath = relPath(vr.inst, inst)
+			end
+		end
+
+		logModelEvent(rec, t, baseline and "PRESENT_AT_START" or "APPEARED",
+			("parts=%d size=%s"):format(rec.partCount, vec(rec.size)))
+
+		table.insert(conns, inst.AncestryChanged:Connect(function()
+			if recording and not rec.removed and not inst:IsDescendantOf(Workspace) then
+				rec.removed = now()
+				logModelEvent(rec, rec.removed, "REMOVED")
+			end
+		end))
+		return true
+	end
+
+	function C.scanPresentModels(root)
+		if not (REC.models and CONFIG.RecordModels and CONFIG.IncludePresentModels) or not root then return end
+		local function walk(container, depth)
+			for _, ch in ipairs(container:GetChildren()) do
+				if #modelList >= CONFIG.MaxModels then return end
+				if ch:IsA("Model") and not ch:IsA("Workspace") then
+					if modelAllowed(ch, root) then registerModel(ch, 0, true, root) end
+				elseif ch:IsA("Folder") and depth < 6 then
+					walk(ch, depth + 1)
+				end
+			end
+		end
+		walk(Workspace, 0)
+	end
+
+	local function positionOf(inst)
+		if inst:IsA("Explosion") then return inst.Position end
+		local p = inst
+		while p and p ~= Workspace do
+			if p:IsA("BasePart") then return p.Position end
+			if p:IsA("Attachment") then return p.WorldPosition end
+			p = p.Parent
+		end
+		return nil
+	end
+
+	local function shouldTrack(inst, root)
+		if vfxByInst[inst] then return false end
+		local cat = CLASS_CATEGORY[inst.ClassName]
+		if not cat then return false end
+		if cat == "PostFX" then
+			return inst.Parent == Lighting or inst.Parent == Workspace.CurrentCamera
+		end
+		if cat == "Sound" and DEFAULT_CHAR_SOUNDS[inst.Name] and inst.Parent and inst.Parent.Name == "HumanoidRootPart" then
+			return false
+		end
+		if inst:IsDescendantOf(character) then return true end
+		if not CONFIG.IncludeOtherPlayers and belongsToOtherPlayer(inst) then return false end
+		local pos = positionOf(inst)
+		if pos then return root ~= nil and (pos - root.Position).Magnitude <= CONFIG.VFXRadius end
+		return cat == "Sound"
+	end
+
+	local function isEffectPart(inst, root)
+		if not CONFIG.TrackEffectParts or vfxByInst[inst] or not inst:IsA("BasePart") or inst:IsA("Terrain") then return false end
+		if inst:IsDescendantOf(character) then return false end
+		if insideTrackedModel(inst) then return false end
+		local model = inst:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then return false end
+		if (inst.Position - root.Position).Magnitude > CONFIG.VFXRadius then return false end
+		return (not inst.CanCollide) or inst.Material == Enum.Material.Neon or inst.Material == Enum.Material.ForceField
+			or inst.Transparency > 0
+	end
+
+	local function describeHost(inst)
+		local host = { parent = inst.Parent and inst.Parent:GetFullName() or "nil" }
+		local p = inst.Parent
+		if p and p:IsA("Attachment") then
+			host.attachment = p.Name
+			host.attachmentCFrame = ser(p.CFrame)
+			p = p.Parent
+		end
+		if p and p:IsA("BasePart") then
+			host.part = p.Name
+			host.onCharacter = p:IsDescendantOf(character)
+		end
+		if host.part then
+			host.label = host.attachment and (host.part .. "/" .. host.attachment) or host.part
+		else
+			host.label = inst.Parent and inst.Parent.Name or "?"
+		end
+		return host
+	end
+
+	local function describeChildren(rec)
+		local out = {}
+		for _, d in ipairs(rec.inst:GetDescendants()) do
+			local list = CHILD_PROPS[d.ClassName]
+			if list then
+				local entry = readProps(d, list)
+				entry.Class = d.ClassName
+				entry.Name = d.Name
+				table.insert(out, entry)
+				collectAssets(entry, d.ClassName, rec.label, rec.assetIds)
+			end
+		end
+		return out
+	end
+
+	local function collectScripts(rec)
+		local function check(d)
+			if d:IsA("LuaSourceContainer") then
+				table.insert(scriptsFound, { vfx = rec.id, name = d.Name, class = d.ClassName, path = d:GetFullName() })
+			end
+		end
+		check(rec.inst)
+		for _, d in ipairs(rec.inst:GetDescendants()) do check(d) end
+	end
+
+	local function makeClone(rec)
+		local inst = rec.inst
+		local prev = inst.Archivable
+		inst.Archivable = true
+
+		for _, d in ipairs(inst:GetDescendants()) do
+			pcall(function() d.Archivable = true end)
+		end
+		local ok, c = pcall(function() return inst:Clone() end)
+		inst.Archivable = prev
+		if not ok or not c then return nil end
+		for _, d in ipairs(c:GetDescendants()) do
+			if d:IsA("BaseScript") then d:Destroy() end
+		end
+		if c:IsA("Sound") then c.Playing = false end
+		for _, d in ipairs(c:GetDescendants()) do
+			if d:IsA("Sound") then d.Playing = false end
+		end
+		if c:IsA("BasePart") then c.Anchored = true end
+		c.Name = ("VFX%03d_%s_%s"):format(rec.id, rec.class, rec.name)
+		return c
+	end
+
+	local function appearDetail(rec)
+		local p = rec.props
+		if rec.category == "EffectPart" then
+			return ("size=%s material=%s transparency=%s"):format(safeEncode(p.Size or {}), tostring(p.Material), tostring(p.Transparency))
+		elseif rec.class == "Sound" then
+			return ("soundId=%s volume=%s"):format(tostring(p.SoundId), tostring(p.Volume))
+		elseif p.Enabled ~= nil then
+			return "enabled=" .. tostring(p.Enabled)
+		end
+		return ""
+	end
+
+	local pendingEmits = setmetatable({}, { __mode = "k" })
+	local pendingCount = 0
+	local lastWatch = 0
+	local WATCH_SKIP = { Enabled = true, TimePosition = true, TimeLength = true, Playing = true, Position = true }
+
+	local function keyOf(v)
+		local tv = type(v)
+		if tv == "number" or tv == "boolean" or tv == "string" then return v end
+		return tostring(v)
+	end
+
+	local function setupWatch(rec)
+		local list = PROPS[rec.class]
+		if not list then return end
+		local inst = rec.inst
+		local watch, last = {}, {}
+		for _, p in ipairs(list) do
+			if not WATCH_SKIP[p] then
+				local ok, v = pcall(function() return inst[p] end)
+				if ok and v ~= nil and typeof(v) ~= "Instance" then
+					watch[#watch + 1] = p
+					last[p] = keyOf(v)
+				end
+			end
+		end
+		if #watch > 0 then
+			rec.watch, rec.last = watch, last
+			table.insert(watchRecs, rec)
+		end
+	end
+
+	local function addEmit(rec, t, n)
+		if #rec.emits >= CONFIG.MaxEmitsPerVFX then return end
+		n = math.floor(tonumber(n) or 1)
+		rec.emits[#rec.emits + 1] = { t = t, n = n }
+		if #rec.emits <= 40 then logEvent(rec, t, "EMIT", ("count=%d"):format(n)) end
+	end
+
+	local function register(inst, t, baseline)
+		if vfxByInst[inst] then return end
+		if #vfxList >= CONFIG.MaxVFX then
+			if not capNotified then
+				capNotified = true
+				notify(("VFX limit reached (%d) - raise CONFIG.MaxVFX if you need more"):format(CONFIG.MaxVFX), "warn")
+			end
+			return
+		end
+		local root = getRoot()
+		local isPart = inst:IsA("BasePart")
+		local rec = {
+			id = #vfxList + 1,
+			inst = inst,
+			class = inst.ClassName,
+			name = inst.Name,
+			category = isPart and "EffectPart" or CLASS_CATEGORY[inst.ClassName],
+			origin = baseline and "present_at_start" or "spawned",
+			path = inst:GetFullName(),
+			start = t,
+			events = {},
+			samples = {},
+			dsamples = {},
+			emits = {},
+			assetIds = {},
+		}
+		rec.label = ("#%d %s"):format(rec.id, rec.name)
+		vfxByInst[inst] = rec
+		table.insert(vfxList, rec)
+
+		rec.host = describeHost(inst)
+
+		do
+			local p = inst.Parent
+			if p and p:IsA("Attachment") then
+				rec.hostAttCF = p.CFrame
+				p = p.Parent
+			end
+			if p and p:IsA("BasePart") and not rec.host.onCharacter and root then
+				rec.hostRel = root.CFrame:ToObjectSpace(p.CFrame)
+			end
+			local anc = inst.Parent
+			while anc and anc ~= Workspace do
+				local hr = vfxByInst[anc]
+				if hr then
+					rec.hostRecId = hr.id
+					rec.hostPath = relPath(inst, anc)
+					break
+				end
+				local mr = modelByInst[anc]
+				if mr then
+					rec.hostModelId = mr.id
+					rec.hostPath = relPath(inst, anc)
+					break
+				end
+				anc = anc.Parent
+			end
+		end
+		rec.props = readProps(inst, PROPS[inst.ClassName] or PART_PROPS)
+		collectAssets(rec.props, rec.class, rec.label, rec.assetIds)
+		collectScripts(rec)
+
+		if isPart then
+			effectPartCount += 1
+			rec.children = describeChildren(rec)
+			if root then
+				local rel = root.CFrame:ToObjectSpace(inst.CFrame)
+				rec.sampleLast = { rel = rel, size = inst.Size, tr = inst.Transparency, col = inst.Color }
+				table.insert(rec.samples, { t = t, cf = rel, size = inst.Size, tr = inst.Transparency, col = inst.Color })
+				rec.relCF = rel
+			end
+			table.insert(partRecs, rec)
+		elseif rec.category == "PostFX" then
+			table.insert(rec.samples, { t = t, v = readProps(inst, PROPS[rec.class]) })
+			table.insert(fxRecs, rec)
+		end
+		if not isPart and rec.class ~= "Explosion" then setupWatch(rec) end
+
+		if cloneCount < CONFIG.MaxClones then
+			rec.clone = makeClone(rec)
+			if rec.clone then cloneCount += 1 end
+		end
+
+		logEvent(rec, t, baseline and "PRESENT_AT_START" or "APPEARED", appearDetail(rec))
+
+		local pend = pendingEmits[inst]
+		if pend then
+			pendingEmits[inst] = nil
+			for _, e in ipairs(pend) do addEmit(rec, e.t, e.n) end
+		end
+
+		if rec.props.Enabled ~= nil then
+			table.insert(conns, inst:GetPropertyChangedSignal("Enabled"):Connect(function()
+				if recording then logEvent(rec, now(), inst.Enabled and "ENABLED" or "DISABLED") end
+			end))
+		end
+		if rec.class == "Sound" then
+			if inst.Playing then logEvent(rec, t, "SOUND_PLAY", ("timePos=%.2f"):format(inst.TimePosition)) end
+			table.insert(conns, inst:GetPropertyChangedSignal("Playing"):Connect(function()
+				if recording then
+					logEvent(rec, now(), inst.Playing and "SOUND_PLAY" or "SOUND_STOP", ("timePos=%.2f"):format(inst.TimePosition))
+				end
+			end))
+		end
+		table.insert(conns, inst.AncestryChanged:Connect(function()
+			if recording and not rec.removed and not inst:IsDescendantOf(game) then
+				rec.removed = now()
+				logEvent(rec, rec.removed, "REMOVED")
+			end
+		end))
+	end
+
+	local function tryRegister(inst, t, kind, root)
+		if kind == "vfx" then
+			if #vfxList < CONFIG.MaxVFX and shouldTrack(inst, root) then register(inst, t, false) end
+		elseif kind == "model" then
+			if modelAllowed(inst, root) then registerModel(inst, t, false, root) end
+		else
+			if #vfxList < CONFIG.MaxVFX and effectPartCount < CONFIG.MaxEffectParts and isEffectPart(inst, root) then
+				register(inst, t, false)
+			elseif CONFIG.RecordModels and not vfxByInst[inst] and looseAllowed(inst) and modelAllowed(inst, root) then
+				registerModel(inst, t, false, root)
+			end
+		end
+	end
+
+	local function processQueue()
+		if qHead > qTail then return end
+		local root = getRoot()
+		local stopAt = os.clock() + CONFIG.QueueBudget
+		while qHead <= qTail do
+			local item = queue[qHead]
+			if item.due > os.clock() then break end
+			queue[qHead] = nil
+			qHead += 1
+			local inst = item.inst
+			if root and inst.Parent then
+				local ok, err = pcall(tryRegister, inst, item.t, item.kind, root)
+			end
+			if os.clock() >= stopAt then break end
+		end
+		if qHead > qTail then qReset() end
+	end
+
+	local function onAdded(inst)
+		if not recording then return end
+		local kind
+		if CLASS_CATEGORY[inst.ClassName] then
+			if not REC.vfx or #vfxList >= CONFIG.MaxVFX then return end
+			kind = "vfx"
+		elseif inst:IsA("BasePart") then
+			local effectOk = REC.vfx and CONFIG.TrackEffectParts and effectPartCount < CONFIG.MaxEffectParts and #vfxList < CONFIG.MaxVFX
+			local looseOk = REC.models and CONFIG.RecordModels and CONFIG.RecordLooseParts and #modelList < CONFIG.MaxModels
+			if not (effectOk or looseOk) then return end
+			local root = getRoot()
+			if not root or (inst.Position - root.Position).Magnitude > math.max(CONFIG.VFXRadius, CONFIG.ModelRadius) then return end
+			kind = "part"
+		elseif REC.models and CONFIG.RecordModels and inst:IsA("Model") and not inst:IsA("Workspace") and #modelList < CONFIG.MaxModels then
+			kind = "model"
+		else
+			return
+		end
+		if qTail - qHead + 1 >= CONFIG.MaxPendingQueue then return end
+		qTail += 1
+		queue[qTail] = { inst = inst, t = now(), kind = kind, due = os.clock() + 0.03 }
+	end
+
+	local function solveTransform(desiredCF, motor)
+		if not motor or not motor.Part0 then return CFrame.new() end
+		return motor.C0:Inverse() * motor.Part0.CFrame:Inverse() * desiredCF * motor.C1
+	end
+
+	local function cfChanged(a, b, eps)
+		if (a.Position - b.Position).Magnitude > eps then return true end
+		return (a.LookVector - b.LookVector).Magnitude > eps or (a.UpVector - b.UpVector).Magnitude > eps
+	end
+
+	local function decimate(list)
+		local out = {}
+		for i = 1, #list, 2 do out[#out + 1] = list[i] end
+		return out
+	end
+
+	local function recordPose(t)
+		local src = REC.target or character
+		if not src or not src.Parent then return end
+		local root = src:FindFirstChild("HumanoidRootPart")
+		local torso = src:FindFirstChild("Torso")
+		if not root or not torso then return end
+
+		local poses = { Torso = solveTransform(torso.CFrame, root:FindFirstChild("RootJoint")) }
+		for _, data in ipairs(JOINTS) do
+			local part = src:FindFirstChild(data.partName)
+			local motor = torso:FindFirstChild(data.motorName)
+			if part and motor then poses[data.partName] = solveTransform(part.CFrame, motor) end
+		end
+		frames[#frames + 1] = { t = t, poses = poses, root = startRootCF:ToObjectSpace(root.CFrame) }
+		if #frames >= CONFIG.MaxFrames then
+			frames = decimate(frames)
+			frameStride *= 2
+		end
+	end
+
+	local function pollTracks(t)
+		local animator = humanoid:FindFirstChildOfClass("Animator")
+		if not animator then return end
+		local current = {}
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			current[track] = true
+			if not activeTracks[track] then
+				local id = track.Animation and track.Animation.AnimationId or ""
+				local ev = {
+					start = t, name = track.Name, id = id, priority = tostring(track.Priority),
+					looped = track.Looped, length = track.Length, speed = track.Speed,
+				}
+				activeTracks[track] = ev
+				table.insert(animEvents, ev)
+			end
+		end
+		for track, ev in pairs(activeTracks) do
+			if not current[track] then
+				ev.stop = t
+				activeTracks[track] = nil
+			end
+		end
+	end
+
+	local function pollOne(rec, t)
+		local inst = rec.inst
+		if rec.removed or not inst.Parent or #rec.dsamples >= CONFIG.MaxSamplesPerVFX then return end
+		local watch, last = rec.watch, rec.last
+		local changed
+		for i = 1, #watch do
+			local p = watch[i]
+			local v = inst[p]
+			local k = keyOf(v)
+			if k ~= last[p] then
+				last[p] = k
+				changed = changed or {}
+				changed[p] = v
+			end
+		end
+		if changed then
+			rec.dsamples[#rec.dsamples + 1] = { t = t, raw = changed }
+			local sv = {}
+			for p, v in pairs(changed) do sv[p] = ser(v) end
+			rec.samples[#rec.samples + 1] = { t = t, v = sv }
+		end
+	end
+
+	local function sampleModels(t, root, doSubs)
+		local eps = CONFIG.SampleEpsilon
+		local rootCF = root.CFrame
+		for _, rec in ipairs(modelList) do
+			local ref = rec.ref
+			if not rec.removed and ref.Parent and #rec.samples < CONFIG.MaxModelSamples then
+				local refCF = ref.CFrame
+				local rel = rootCF:ToObjectSpace(refCF)
+				if cfChanged(rel, rec.lastRel, eps) then
+					rec.lastRel = rel
+					rec.samples[#rec.samples + 1] = { t = t, cf = rel, w = refCF }
+				end
+			end
+		end
+		if not doSubs then return end
+		local n = #modelList
+		if n == 0 then return end
+		local stopAt = os.clock() + CONFIG.ModelSampleBudget
+		local count = 0
+		while count < n do
+			if modelCursor > n then modelCursor = 1 end
+			local rec = modelList[modelCursor]
+			modelCursor += 1
+			count += 1
+			local ref = rec.ref
+			if not rec.removed and ref.Parent then
+				local refCF = ref.CFrame
+				for _, sub in ipairs(rec.subs) do
+					local part = sub.inst
+					if part.Parent and #sub.samples < CONFIG.MaxSubPartSamples then
+						local rel = refCF:ToObjectSpace(part.CFrame)
+						local size, tr, col = part.Size, part.Transparency, part.Color
+						local last = sub.last
+						if cfChanged(rel, last.rel, eps) or (size - last.size).Magnitude > eps
+							or math.abs(tr - last.tr) > 0.005 or col ~= last.col then
+							sub.last = { rel = rel, size = size, tr = tr, col = col }
+							sub.samples[#sub.samples + 1] = { t = t, cf = rel, size = size, tr = tr, col = col }
+						end
+					end
+				end
+			end
+			if os.clock() >= stopAt then break end
+		end
+	end
+
+	local function sampleEffects(t)
+		local root = getRoot()
+		local eps = CONFIG.SampleEpsilon
+		if root then
+			for _, rec in ipairs(partRecs) do
+				local part = rec.inst
+				if not rec.removed and part.Parent and #rec.samples < CONFIG.MaxSamplesPerVFX then
+					local rel = root.CFrame:ToObjectSpace(part.CFrame)
+					local last = rec.sampleLast
+					local size, tr, col = part.Size, part.Transparency, part.Color
+					if not last or cfChanged(rel, last.rel, eps) or (size - last.size).Magnitude > eps
+						or math.abs(tr - last.tr) > 0.005 or col ~= last.col then
+						rec.sampleLast = { rel = rel, size = size, tr = tr, col = col }
+						table.insert(rec.samples, { t = t, cf = rel, size = size, tr = tr, col = col })
+					end
+				end
+			end
+		end
+		local c = os.clock()
+		local doWatch = false
+		if c - lastWatch >= CONFIG.WatchInterval then
+			lastWatch = c
+			doWatch = true
+			for _, rec in ipairs(watchRecs) do pcall(pollOne, rec, t) end
+		end
+		if root and #modelList > 0 then
+			local okM, errM = pcall(sampleModels, t, root, doWatch)
+		end
+	end
+
+	function C.recordFrame()
+		if not recording or not character or not character.Parent then return end
+		if REC.vfx or REC.models then processQueue() end
+		local t = now()
+		if REC.pose then
+			frameCounter += 1
+			if frameCounter % frameStride == 0 then recordPose(t) end
+		end
+		if REC.tracks then pollTracks(t) end
+		if REC.vfx or REC.models then sampleEffects(t) end
+		refreshHud(false)
+	end
+
+	function C.recordCamera()
+		if not recording or not REC.cam then return end
+		local cam = Workspace.CurrentCamera
+		local root = getRoot()
+		if not cam or not root then return end
+		camCounter += 1
+		if camCounter % camStride ~= 0 then return end
+		camSamples[#camSamples + 1] = {
+			t = now(),
+			cf = cam.CFrame,
+			rel = root.CFrame:ToObjectSpace(cam.CFrame),
+			fov = cam.FieldOfView,
+		}
+		if #camSamples >= CONFIG.MaxCamSamples then
+			camSamples = decimate(camSamples)
+			camStride *= 2
+		end
+	end
+
+	local emitQueued = setmetatable({}, { __mode = "k" })
+
+	local function handleEmit(self, count)
+		if not recording or typeof(self) ~= "Instance" then return end
+		local rec = vfxByInst[self]
+		if rec then
+			addEmit(rec, now(), count)
+			return
+		end
+		if not self:IsA("ParticleEmitter") then return end
+		local list = pendingEmits[self]
+		if not list then
+			if pendingCount >= 300 then return end
+			pendingCount += 1
+			list = {}
+			pendingEmits[self] = list
+		end
+		if #list < 50 then list[#list + 1] = { t = now(), n = count } end
+		if not emitQueued[self] then
+			emitQueued[self] = true
+			onAdded(self)
+		end
+	end
+
+	local function installEmitHook()
+		local state = sharedEnv.R6RecorderEmit
+		if type(state) ~= "table" then
+			state = {}
+			local ok = pcall(function()
+				local hook, getMethod = hookmetamethod, getnamecallmethod
+				if type(hook) ~= "function" or type(getMethod) ~= "function" then error("unsupported") end
+				local wrap = type(newcclosure) == "function" and newcclosure or function(f) return f end
+				local old
+				old = hook(game, "__namecall", wrap(function(self, ...)
+					local h = state.handler
+					if h and getMethod() == "Emit" then
+						pcall(h, self, ...)
+					end
+					return old(self, ...)
+				end))
+			end)
+			state.installed = ok
+			sharedEnv.R6RecorderEmit = state
+		end
+		state.handler = handleEmit
+		return state.installed == true
+	end
+
+	function C.reset()
+		pendingEmits = setmetatable({}, { __mode = "k" })
+		emitQueued = setmetatable({}, { __mode = "k" })
+		pendingCount = 0
+		lastWatch = 0
+		modelCursor = 1
+		modelCapNotified = false
+	end
+
+	function C.startHooks()
+		C.emitHook = installEmitHook()
+	end
+
+	C.shouldTrack = shouldTrack
+	C.register = register
+	C.onAdded = onAdded
+	return C
+end)()
+
+local VR = (function()
+	local V = {}
+
+	local function resolve(from, path)
+		local cur = from
+		for _, n in ipairs(path) do
+			cur = cur and cur:FindFirstChild(n)
+			if not cur then return nil end
+		end
+		return cur
+	end
+
+	function V.snapshot(length)
+		local out = {}
+		for _, rec in ipairs(vfxList) do
+			if rec.clone then
+				out[#out + 1] = {
+					key = rec.id, id = rec.id, class = rec.class, name = rec.name, category = rec.category,
+					start = rec.start, stop = rec.removed or length, ends = rec.removed ~= nil,
+					template = rec.clone, host = rec.host, hostAttCF = rec.hostAttCF, hostRel = rec.hostRel,
+					hostKey = rec.hostRecId or (rec.hostModelId and ("M" .. rec.hostModelId) or nil), hostPath = rec.hostPath,
+					events = rec.events, emits = rec.emits,
+					samples = rec.samples, dsamples = rec.dsamples, enabled0 = rec.props.Enabled,
+				}
+			end
+		end
+		return out
+	end
+
+	function V.snapshotModels(length)
+		local out = {}
+		for _, rec in ipairs(modelList) do
+			if rec.clone and #rec.samples > 0 then
+				local subs, strip = {}, false
+				for _, s in ipairs(rec.subs) do
+					if #s.samples > 0 then
+						subs[#subs + 1] = { path = s.path, samples = s.samples }
+						if #s.samples >= 2 then strip = true end
+					end
+				end
+				out[#out + 1] = {
+					key = "M" .. rec.id, id = rec.id, isModel = true, class = rec.class, name = rec.name, category = "Model",
+					start = rec.start, stop = rec.removed or length, ends = rec.removed ~= nil,
+					template = rec.clone, refPath = rec.refPath, samples = rec.samples, subs = subs,
+					strip = strip, events = {}, emits = {}, dsamples = {},
+				}
+			end
+		end
+		return out
+	end
+
+	function V.play(model, session, wantVfx, wantModels)
+		local vdata = wantVfx and session.vfx or {}
+		local mdata = wantModels and session.models or {}
+		local root = model:FindFirstChild("HumanoidRootPart")
+		if (#vdata + #mdata) == 0 or not root then return nil end
+
+		local rootCF = root.CFrame
+		local length = session.length or 0
+		local folder = Instance.new("Folder")
+		folder.Name = "R6VFXReplay"
+		folder.Parent = Workspace
+
+		local states, byId = {}, {}
+		for _, list in ipairs({ mdata, vdata }) do
+			for _, d in ipairs(list) do
+				local st = { d = d, ev = 1, em = 1, ds = 1, sm = 1 }
+				states[#states + 1] = st
+				byId[d.key] = st
+			end
+		end
+
+		local function setProp(obj, p, v)
+			pcall(function() obj[p] = v end)
+		end
+
+		local function makeHost(d)
+			local h = d.host or {}
+			if d.category == "PostFX" then
+				if tostring(h.parent or ""):find("Camera", 1, true) and Workspace.CurrentCamera then
+					return Workspace.CurrentCamera
+				end
+				return Lighting
+			end
+			if d.category == "EffectPart" then return folder end
+
+			local part
+			if h.onCharacter and h.part then
+				part = model:FindFirstChild(h.part, true)
+				if part and not part:IsA("BasePart") then part = nil end
+			elseif d.hostRel then
+				part = Instance.new("Part")
+				part.Name = "VFXHost"
+				part.Size = Vector3.new(0.2, 0.2, 0.2)
+				part.Transparency = 1
+				part.Anchored = true
+				part.CanCollide = false
+				part.CanQuery = false
+				part.CanTouch = false
+				part.CFrame = rootCF * d.hostRel
+				part.Parent = folder
+			end
+			if not part then
+				if d.category == "Sound" and not h.onCharacter then
+					if h.parent == "SoundService" then return SoundService end
+					return folder
+				end
+				part = root
+			end
+			if h.attachment then
+				local att = part:FindFirstChild(h.attachment)
+				if not (att and att:IsA("Attachment")) then
+					att = Instance.new("Attachment")
+					att.Name = h.attachment
+					att.CFrame = d.hostAttCF or CFrame.new()
+					att.Parent = part
+				end
+				return att
+			end
+			return part
+		end
+
+		local function spawnModel(st)
+			local d = st.d
+			local ok, c = pcall(function() return d.template:Clone() end)
+			if not ok or not c then
+				st.dead = true
+				return false
+			end
+			c.Name = d.name
+			if d.strip then
+
+				for _, x in ipairs(c:GetDescendants()) do
+					if x:IsA("JointInstance") or x:IsA("WeldConstraint") then pcall(function() x:Destroy() end) end
+				end
+			end
+			local function lock(x)
+				if x:IsA("BasePart") then
+					x.Anchored = true
+					x.CanCollide = false
+					x.CanQuery = false
+					x.CanTouch = false
+				end
+			end
+			pcall(lock, c)
+			for _, x in ipairs(c:GetDescendants()) do pcall(lock, x) end
+			c.Parent = folder
+
+			local ref = resolve(c, d.refPath)
+			if not ref or not ref:IsA("BasePart") then
+				pcall(function() c:Destroy() end)
+				st.dead = true
+				return false
+			end
+			st.obj, st.ref = c, ref
+			st.subObjs, st.subCur = {}, {}
+			for i, s in ipairs(d.subs) do
+				local p = resolve(c, s.path)
+				st.subObjs[i] = (p and p:IsA("BasePart")) and p or false
+				st.subCur[i] = 1
+			end
+			return true
+		end
+
+		local function spawn(st)
+			local d = st.d
+			if d.isModel then return spawnModel(st) end
+			if d.hostKey and byId[d.hostKey] then
+
+				local ps = byId[d.hostKey]
+				if ps.dead or ps.finished then
+					st.dead = true
+					return false
+				end
+				if not ps.obj then return false end
+				local found
+				if d.hostPath and #d.hostPath > 0 then
+					found = resolve(ps.obj, d.hostPath)
+				else
+					found = ps.obj:FindFirstChild(d.name, true)
+				end
+				if not found then
+					st.dead = true
+					return false
+				end
+				if d.enabled0 ~= nil then setProp(found, "Enabled", d.enabled0) end
+				st.obj = found
+				st.bound = true
+				return true
+			end
+
+			local ok, c = pcall(function() return d.template:Clone() end)
+			if not ok or not c then
+				st.dead = true
+				return false
+			end
+			c.Name = d.name
+			local okH, host = pcall(makeHost, d)
+			if not okH or not host then
+				c:Destroy()
+				st.dead = true
+				return false
+			end
+			if d.category == "EffectPart" then
+				pcall(function()
+					c.Anchored = true
+					c.CanCollide = false
+					c.CanQuery = false
+					c.CanTouch = false
+				end)
+			end
+			if d.enabled0 ~= nil then setProp(c, "Enabled", d.enabled0) end
+			c.Parent = host
+			st.obj = c
+			return true
+		end
+
+		local function stepModel(st, t)
+			local d = st.d
+			local ref, obj = st.ref, st.obj
+			if not ref or not ref.Parent then return end
+			local sp = d.samples
+			local n = #sp
+			local i = st.sm
+			while i < n and sp[i + 1].t <= t do i += 1 end
+			st.sm = i
+			local a, b = sp[i], sp[i + 1] or sp[i]
+			local alpha = (b.t > a.t) and math.clamp((t - a.t) / (b.t - a.t), 0, 1) or 0
+			local desired = rootCF * a.cf:Lerp(b.cf, alpha)
+			obj:PivotTo((desired * ref.CFrame:Inverse()) * obj:GetPivot())
+
+			for si, s in ipairs(d.subs) do
+				local part = st.subObjs[si]
+				if part and part.Parent then
+					local ss = s.samples
+					local m = #ss
+					local c = st.subCur[si]
+					while c < m and ss[c + 1].t <= t do c += 1 end
+					st.subCur[si] = c
+					local sa, sb = ss[c], ss[c + 1] or ss[c]
+					local al = (sb.t > sa.t) and math.clamp((t - sa.t) / (sb.t - sa.t), 0, 1) or 0
+					local sz = sa.size:Lerp(sb.size, al)
+					if (part.Size - sz).Magnitude > 0.001 then part.Size = sz end
+					part.Transparency = sa.tr + (sb.tr - sa.tr) * al
+					part.Color = sa.col:Lerp(sb.col, al)
+					part.CFrame = desired * sa.cf:Lerp(sb.cf, al)
+				end
+			end
+		end
+
+		local function step(st, t)
+			local d = st.d
+			if st.dead or st.finished then return end
+			if not st.obj then
+				if t < d.start then return end
+				if not spawn(st) then return end
+			end
+			local obj = st.obj
+
+			if d.ends and t >= d.stop then
+				st.finished = true
+				st.obj = nil
+				pcall(function() obj:Destroy() end)
+				return
+			end
+
+			if d.isModel then
+				stepModel(st, t)
+				return
+			end
+
+			local evs = d.events
+			while st.ev <= #evs and evs[st.ev].t <= t do
+				local k = evs[st.ev].kind
+				st.ev += 1
+				if k == "ENABLED" then
+					setProp(obj, "Enabled", true)
+				elseif k == "DISABLED" then
+					setProp(obj, "Enabled", false)
+				elseif k == "SOUND_PLAY" then
+					pcall(function() obj:Play() end)
+				elseif k == "SOUND_STOP" then
+					pcall(function() obj:Stop() end)
+				end
+			end
+
+			local ems = d.emits
+			while st.em <= #ems and ems[st.em].t <= t do
+				local e = ems[st.em]
+				st.em += 1
+				pcall(function() obj:Emit(e.n) end)
+			end
+
+			local ds = d.dsamples
+			while st.ds <= #ds and ds[st.ds].t <= t do
+				for p, v in pairs(ds[st.ds].raw) do setProp(obj, p, v) end
+				st.ds += 1
+			end
+
+			if d.category == "EffectPart" and not st.bound then
+				local sp = d.samples
+				local n = #sp
+				if n > 0 then
+					local i = st.sm
+					while i < n and sp[i + 1].t <= t do i += 1 end
+					st.sm = i
+					local a, b = sp[i], sp[i + 1] or sp[i]
+					local alpha = (b.t > a.t) and math.clamp((t - a.t) / (b.t - a.t), 0, 1) or 0
+					pcall(function()
+						obj.CFrame = rootCF * a.cf:Lerp(b.cf, alpha)
+						obj.Size = a.size:Lerp(b.size, alpha)
+						obj.Transparency = a.tr + (b.tr - a.tr) * alpha
+						if a.col and b.col then obj.Color = a.col:Lerp(b.col, alpha) end
+					end)
+				end
+			end
+		end
+
+		local t0 = os.clock()
+		local conn
+		local playerObj = { Count = #states }
+
+		function playerObj.Stop()
+			if conn then
+				conn:Disconnect()
+				conn = nil
+			end
+			for _, st in ipairs(states) do
+
+				if st.obj and not st.bound then pcall(function() st.obj:Destroy() end) end
+				st.obj = nil
+			end
+			pcall(function() folder:Destroy() end)
+		end
+
+		conn = RunService.Heartbeat:Connect(function()
+			local t = os.clock() - t0
+			for _, st in ipairs(states) do
+				local ok, err = pcall(step, st, t)
+				if not ok then
+					st.dead = true
+				end
+			end
+			if t > length + 0.3 then playerObj.Stop() end
+		end)
+
+		return playerObj
+	end
+
+	return V
+end)()
+
+local PB = (function()
+	local P = {}
+
+	local EasingStyleMap = {
+		[Enum.PoseEasingStyle.Linear] = Enum.EasingStyle.Linear,
+		[Enum.PoseEasingStyle.Bounce] = Enum.EasingStyle.Bounce,
+		[Enum.PoseEasingStyle.Cubic] = Enum.EasingStyle.Cubic,
+		[Enum.PoseEasingStyle.Elastic] = Enum.EasingStyle.Elastic,
+		[Enum.PoseEasingStyle.Constant] = Enum.EasingStyle.Linear,
+	}
+
+	local EasingDirectionMap = {
+		[Enum.PoseEasingDirection.In] = Enum.EasingDirection.In,
+		[Enum.PoseEasingDirection.Out] = Enum.EasingDirection.Out,
+		[Enum.PoseEasingDirection.InOut] = Enum.EasingDirection.InOut,
+	}
+
+	local function PlayKeyframeSequence(Model, KeyframeSequence, SpeedMult)
+		SpeedMult = SpeedMult or 1
+
+		local kfs = {}
+		for _, kf in ipairs(KeyframeSequence:GetKeyframes()) do
+			table.insert(kfs, { Time = kf.Time, KF = kf })
+		end
+		table.sort(kfs, function(a, b) return a.Time < b.Time end)
+		if #kfs == 0 then return nil end
+
+		local motorMap = {}
+		local function getMotor(poseName)
+			if motorMap[poseName] then return motorMap[poseName] end
+			for _, m in ipairs(Model:GetDescendants()) do
+				if m:IsA("Motor6D") and m.Part1 and m.Part1.Name == poseName then
+					motorMap[poseName] = m
+					return m
+				end
+			end
+			return nil
+		end
+
+		local jointData = {}
+		for _, entry in ipairs(kfs) do
+			for _, pose in ipairs(entry.KF:GetDescendants()) do
+				if pose:IsA("Pose") and pose.Weight > 0 then
+					local motor = getMotor(pose.Name)
+					if motor then
+						jointData[pose.Name] = jointData[pose.Name] or {}
+						table.insert(jointData[pose.Name], {
+							time = entry.Time, cframe = pose.CFrame,
+							style = pose.EasingStyle, dir = pose.EasingDirection, motor = motor,
+						})
+					end
+				end
+			end
+		end
+
+		local animLen = kfs[#kfs].Time
+		local hb = nil
+		local startT = 0
+		local cursors = {}
+		local object = { Length = animLen / SpeedMult }
+
+		function object.Stop()
+			if hb then
+				hb:Disconnect()
+				hb = nil
+			end
+		end
+
+		function object.Play()
+			object.Stop()
+			startT = os.clock()
+			cursors = {}
+			hb = RunService.Heartbeat:Connect(function()
+				if not Model or not Model.Parent then
+					object.Stop()
+					return
+				end
+				local t = (os.clock() - startT) * SpeedMult
+				if animLen > 0 then t = t % animLen end
+
+				for name, poses in pairs(jointData) do
+
+					local c = cursors[name] or 1
+					if poses[c].time > t then c = 1 end
+					while c < #poses and poses[c + 1].time <= t do c += 1 end
+					cursors[name] = c
+
+					local prev = poses[c]
+					local nxt = poses[c + 1] or prev
+					local alpha = (nxt.time > prev.time) and (t - prev.time) / (nxt.time - prev.time) or 0
+					local eased = TweenService:GetValue(alpha,
+						EasingStyleMap[nxt.style] or Enum.EasingStyle.Linear,
+						EasingDirectionMap[nxt.dir] or Enum.EasingDirection.InOut)
+					prev.motor.Transform = prev.cframe:Lerp(nxt.cframe, eased)
+				end
+			end)
+		end
+
+		return object
+	end
+
+	local camPlaybackConn, camRestore = nil, nil
+
+	function P.stopCamera()
+		if camRestore then camRestore() end
+	end
+
+	local currentVfx = nil
+	function P.stopVFX()
+		if currentVfx then
+			pcall(currentVfx.Stop)
+			currentVfx = nil
+		end
+	end
+
+	local function playCamera(targetRoot, samples, speed)
+		P.stopCamera()
+		local cam = Workspace.CurrentCamera
+		if not cam or #samples < 2 then return end
+		speed = speed or 1
+		local prevType, prevFov = cam.CameraType, cam.FieldOfView
+		local length = samples[#samples].t
+		local startT = os.clock()
+		local idx = 1
+		cam.CameraType = Enum.CameraType.Scriptable
+
+		camRestore = function()
+			if camPlaybackConn then
+				camPlaybackConn:Disconnect()
+				camPlaybackConn = nil
+			end
+			cam.CameraType = prevType
+			cam.FieldOfView = prevFov
+			camRestore = nil
+		end
+
+		camPlaybackConn = RunService.RenderStepped:Connect(function()
+			local t = (os.clock() - startT) * speed
+			if t >= length or not targetRoot.Parent then
+				P.stopCamera()
+				return
+			end
+			while idx < #samples - 1 and samples[idx + 1].t <= t do idx += 1 end
+			local a, b = samples[idx], samples[idx + 1]
+			local alpha = math.clamp((t - a.t) / math.max(b.t - a.t, 1e-4), 0, 1)
+			cam.CFrame = targetRoot.CFrame * a.rel:Lerp(b.rel, alpha)
+			cam.FieldOfView = a.fov + (b.fov - a.fov) * alpha
+		end)
+	end
+
+	local function spawnTestClone(stripVfx)
+		makeArchivable(character)
+		local clone = character:Clone()
+		if not clone then return nil end
+		clone.Name = "R6TestClone"
+		for _, d in ipairs(clone:GetDescendants()) do
+			if d:IsA("BaseScript") or (stripVfx and CLASS_CATEGORY[d.ClassName]) then d:Destroy() end
+		end
+		local hum = clone:FindFirstChildOfClass("Humanoid")
+		if hum then
+			local animator = hum:FindFirstChildOfClass("Animator")
+			if animator then animator:Destroy() end
+			pcall(function() hum.EvaluateStateMachine = false end)
+			hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+		end
+		local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+		if cloneRoot then cloneRoot.Anchored = true end
+		for _, m in ipairs(clone:GetDescendants()) do
+			if m:IsA("Motor6D") then
+				m.Enabled = true
+				m.Transform = CFrame.new()
+			end
+		end
+		clone.Parent = Workspace
+		clone:PivotTo(character:GetPivot() * CFrame.new(8, 0, 0))
+		return clone
+	end
+
+	function P.replay(quiet)
+		if recording or finalizing then return end
+		if not lastSession or not lastSession.ks or not lastSession.ks.Parent then
+			notify("Nothing recorded yet - press START first.", "warn")
+			return
+		end
+		P.stopCamera()
+		P.stopVFX()
+		if testClone then
+			testClone:Destroy()
+			testClone = nil
+		end
+		local wantVfx = CONFIG.ReplayVFX and lastSession.vfx ~= nil and #lastSession.vfx > 0
+		local wantModels = CONFIG.RecordModels and lastSession.models ~= nil and #lastSession.models > 0
+		local okClone, clone = pcall(spawnTestClone, wantVfx)
+		if not okClone or not clone then
+			notify("Could not create the test clone.", "err")
+			return
+		end
+		testClone = clone
+		local okPb, pb
+		if lastSession.noFrames then
+			okPb, pb = true, { Length = math.max(lastSession.length, 0.3), Play = function() end, Stop = function() end }
+		else
+			okPb, pb = pcall(PlayKeyframeSequence, clone, lastSession.ks, 1)
+		end
+		if not okPb or not pb then
+			clone:Destroy()
+			testClone = nil
+			return
+		end
+		pb.Play()
+		local cloneRoot = clone:FindFirstChild("HumanoidRootPart")
+		if cloneRoot then playCamera(cloneRoot, lastSession.cam, 1) end
+		local vfxPlayer = nil
+		if wantVfx or wantModels then
+			local okV, v = pcall(VR.play, clone, lastSession, wantVfx, wantModels)
+			if okV and v then
+				vfxPlayer = v
+				currentVfx = v
+			elseif not okV then
+			end
+		end
+		setSubtitle(vfxPlayer and "Replaying + VFX/models..." or "Replaying...", THEME.accent)
+		if quiet ~= true then
+			setStatus(("Replaying on test clone (%.2fs)%s..."):format(pb.Length,
+				vfxPlayer and (" + " .. vfxPlayer.Count .. " VFX/models") or ""))
+		end
+		task.delay(pb.Length + 0.5, function()
+			pb.Stop()
+			if vfxPlayer then
+				pcall(vfxPlayer.Stop)
+				if currentVfx == vfxPlayer then currentVfx = nil end
+			end
+			if testClone == clone then testClone = nil end
+			if clone.Parent then clone:Destroy() end
+			if not recording and not finalizing then
+				setSubtitle("v9 - ready")
+				if quiet ~= true then setStatus("Replay finished. Press R (or REPLAY) to replay again.") end
+			end
+		end)
+	end
+
+	return P
+end)()
+
+local EX = (function()
+	local X = {}
+
+	local function mapVfxSample(s)
+		if s.cf then
+			return { t = rnd(s.t), cf = cfArr(s.cf), size = ser(s.size), tr = rnd(s.tr), col = s.col and ser(s.col) or nil }
+		end
+		return { t = rnd(s.t), v = s.v }
+	end
+
+	local function mapEmit(e)
+		return { t = rnd(e.t), n = e.n }
+	end
+
+	local function mapModelSample(s)
+		return { t = rnd(s.t), cf = cfArr(s.cf), w = cfArr(s.w) }
+	end
+
+	local function buildVFXJson()
+		local parts = {}
+		for _, rec in ipairs(vfxList) do
+			local scripts = {}
+			for _, sc in ipairs(scriptsFound) do
+				if sc.vfx == rec.id then table.insert(scripts, { name = sc.name, class = sc.class, path = sc.path }) end
+			end
+			local head = {
+				id = rec.id, class = rec.class, name = rec.name, category = rec.category, origin = rec.origin,
+				path = rec.path, host = rec.host, start = rnd(rec.start), removed = rec.removed and rnd(rec.removed) or nil,
+				hostRecId = rec.hostRecId, hostModelId = rec.hostModelId, hostPath = rec.hostPath,
+				events = rec.events, props = rec.props, children = rec.children, scripts = scripts,
+			}
+			parts[#parts + 1] = jsonWithArrays(head, {
+				{ "samples", encodeArray(rec.samples, 100, mapVfxSample) },
+				{ "emits", encodeArray(rec.emits, 200, mapEmit) },
+			})
+			slice()
+		end
+		return "[" .. table.concat(parts, ",") .. "]"
+	end
+
+	local function buildModelsJson()
+		local parts = {}
+		for _, rec in ipairs(modelList) do
+			local scripts = {}
+			for _, sc in ipairs(scriptsFound) do
+				if sc.model == rec.id then table.insert(scripts, { name = sc.name, class = sc.class, path = sc.path }) end
+			end
+			local subJson = {}
+			for _, sub in ipairs(rec.subs) do
+				subJson[#subJson + 1] = jsonWithArrays({ name = sub.name, path = sub.path }, {
+					{ "samples", encodeArray(sub.samples, 100, mapVfxSample) },
+				})
+			end
+			local head = {
+				id = rec.id, class = rec.class, name = rec.name, origin = rec.origin, path = rec.path,
+				start = rnd(rec.start), removed = rec.removed and rnd(rec.removed) or nil,
+				parts = rec.partCount, size = ser(rec.size), refPath = rec.refPath, events = rec.events,
+				assets = rec.assetIds, scripts = scripts,
+				note = "samples: cf = reference part CFrame relative to HumanoidRootPart, w = world CFrame. subParts samples: cf relative to the reference part (path = child names below the model).",
+			}
+			parts[#parts + 1] = jsonWithArrays(head, {
+				{ "samples", encodeArray(rec.samples, 100, mapModelSample) },
+				{ "subParts", "[" .. table.concat(subJson, ",") .. "]" },
+			})
+			slice()
+		end
+		return "[" .. table.concat(parts, ",") .. "]"
+	end
+
+	local function buildCameraJson(length)
+		local head = {
+			length = rnd(length),
+			note = "cf = world CFrame components, rel = CFrame relative to HumanoidRootPart (use rootCFrame * rel on your own rig)",
+			start = camStart,
+		}
+		local samples = encodeArray(camSamples, 150, function(s)
+			return { t = rnd(s.t), cf = cfArr(s.cf), rel = cfArr(s.rel), fov = rnd(s.fov) }
+		end)
+		return jsonWithArrays(head, { { "samples", samples } })
+	end
+
+	local function buildAnimationJson(sessionName, length)
+		local head = {
+			name = sessionName, length = rnd(length), rig = "R6", priority = "Action", loop = true,
+			note = "poses = Motor6D Transform per joint (CFrame components). rootMotion = HumanoidRootPart relative to its start pose.",
+		}
+		local framesJson = encodeArray(frames, 100, function(f)
+			local poses = {}
+			for name, cf in pairs(f.poses) do poses[name] = cfArr(cf) end
+			return { t = rnd(f.t), poses = poses }
+		end)
+		local rootJson = encodeArray(frames, 150, function(f) return { t = rnd(f.t), cf = cfArr(f.root) } end)
+		return jsonWithArrays(head, { { "frames", framesJson }, { "rootMotion", rootJson } })
+	end
+
+	local function nameLooksRelevant(name)
+		local lower = name:lower()
+		for _, h in ipairs(MODULE_HINTS) do
+			if lower:find(h, 1, true) then return true end
+		end
+		return false
+	end
+
+	local function scanDependencies(ownFolder)
+		local out = {}
+		local function consider(d, label, filterFn)
+			if d:IsA("LuaSourceContainer") and filterFn(d) then
+				out[#out + 1] = ("  %s: %s (%s)"):format(label, d:GetFullName(), d.ClassName)
+			end
+		end
+		local function scan(container, label, filterFn)
+			if not container or #out >= 60 then return end
+			consider(container, label, filterFn)
+			local list = container:GetDescendants()
+			for i = 1, #list do
+				if #out >= 60 then return end
+				consider(list[i], label, filterFn)
+				if i % 150 == 0 then slice() end
+			end
+		end
+		scan(character, "character script", function(d) return d.Name ~= "Animate" and d.Name ~= "Health" end)
+		scan(player:FindFirstChild("PlayerScripts"), "player script", function(d)
+			return d:GetFullName():find("PlayerModule", 1, true) == nil and d.Name ~= "RbxCharacterSounds"
+		end)
+		local moduleFilter = function(d) return d:IsA("ModuleScript") and nameLooksRelevant(d.Name) end
+		for _, child in ipairs(ReplicatedStorage:GetChildren()) do
+			if child ~= ownFolder then scan(child, "possibly related module", moduleFilter) end
+		end
+		scan(ReplicatedFirst, "possibly related module", moduleFilter)
+		return out
+	end
+
+	local function buildReport(sessionName, length, camEnd, depLines)
+		local buf = newBuf()
+		local add = buf.add
+
+		add("==================== R6 RECORDER REPORT ====================")
+		add("Session : " .. sessionName)
+		add("Mode    : " .. REC.label .. (REC.victim and (" | victim: " .. REC.victim) or ""))
+		add(("Game    : %s (PlaceId %d)"):format(game.Name, game.PlaceId))
+		add("Date    : " .. os.date("%Y-%m-%d %H:%M:%S"))
+		add(("Length  : %.3fs | keyframes: %d (~%.0f/s) | camera samples: %d | VFX tracked: %d | models tracked: %d"):format(
+			length, #frames, #frames / math.max(length, 1e-3), #camSamples, #vfxList, #modelList))
+		add("Rig     : R6 | KeyframeSequence priority Action | loop true")
+
+		add("")
+		add("[1] ANIMATION")
+		local rootLen = 0
+		for i = 2, #frames do
+			rootLen += (frames[i].root.Position - frames[i - 1].root.Position).Magnitude
+		end
+		local lastRoot = frames[#frames] and frames[#frames].root
+		add(("  Root motion (NOT baked into the keyframes): traveled %.1f studs, final offset %s"):format(
+			rootLen, lastRoot and vec(lastRoot.Position) or "(0, 0, 0)"))
+		if #animEvents == 0 then
+			add("  Game animation tracks playing: none detected")
+		else
+			add("  Game animation tracks playing (names/times only - the animation itself is the KeyframeSequence code above):")
+			for _, ev in ipairs(animEvents) do
+				add(("  [%s -> %s] \"%s\" priority=%s looped=%s length=%.2fs speed=%.2f"):format(
+					fmtT(ev.start), fmtT(ev.stop or length), ev.name, ev.priority, tostring(ev.looped), ev.length, ev.speed))
+			end
+		end
+
+		add("")
+		add("[2] VFX TIMELINE (chronological)")
+		local events = {}
+		for _, rec in ipairs(vfxList) do
+			for _, e in ipairs(rec.events) do
+				events[#events + 1] = { t = e.t, rec = rec, kind = e.kind, detail = e.detail }
+			end
+		end
+		slice()
+		table.sort(events, function(a, b)
+			if a.t ~= b.t then return a.t < b.t end
+			return a.rec.id < b.rec.id
+		end)
+		if #events == 0 then
+			add("  No VFX detected.")
+		else
+			for i, e in ipairs(events) do
+				if i > CONFIG.MaxTimelineLines then
+					add(("  ... +%d more events (all of them are in vfx.json)"):format(#events - CONFIG.MaxTimelineLines))
+					break
+				end
+				add(("  [%s] #%-3d %-16s %-16s \"%s\" @ %s %s"):format(
+					fmtT(e.t), e.rec.id, e.kind, e.rec.class, e.rec.name, e.rec.host.label, e.detail))
+			end
+		end
+
+		add("")
+		add("[3] VFX DETAILS (everything needed to rebuild each effect)")
+		for _, rec in ipairs(vfxList) do
+			add(("  #%d %s \"%s\" [%s] origin=%s"):format(rec.id, rec.class, rec.name, rec.category, rec.origin))
+			add(("     host: %s%s | path: %s"):format(rec.host.label,
+				rec.host.attachmentCFrame and (" | attachment offset " .. safeEncode(rec.host.attachmentCFrame)) or "", rec.path))
+			add(("     active: %s -> %s%s"):format(fmtT(rec.start), fmtT(rec.removed or length),
+				rec.removed and "" or " (until end of recording)"))
+			add("     props: " .. safeEncode(rec.props))
+			if #rec.emits > 0 then
+				local total = 0
+				for _, e in ipairs(rec.emits) do total += e.n end
+				add(("     emits: %d calls, %d particles | first at %s, last at %s"):format(
+					#rec.emits, total, fmtT(rec.emits[1].t), fmtT(rec.emits[#rec.emits].t)))
+			end
+			if rec.watch and #rec.dsamples > 0 then
+				add(("     property changes recorded: %d (tweened values, see vfx.json)"):format(#rec.dsamples))
+			end
+			if rec.hostModelId then
+				add(("     lives inside model M#%d (replayed inside that model's clone)"):format(rec.hostModelId))
+			end
+			if rec.children and #rec.children > 0 then add("     children: " .. safeEncode(rec.children)) end
+			if rec.category == "EffectPart" and #rec.samples > 0 then
+				local first, last = rec.samples[1], rec.samples[#rec.samples]
+				local travel = 0
+				for i = 2, #rec.samples do
+					travel += (rec.samples[i].cf.Position - rec.samples[i - 1].cf.Position).Magnitude
+				end
+				add(("     motion (relative to root): %s -> %s | travel %.1f studs | %d samples"):format(
+					vec(first.cf.Position), vec(last.cf.Position), travel, #rec.samples))
+				add(("     size %s -> %s | transparency %.2f -> %.2f"):format(vec(first.size), vec(last.size), first.tr, last.tr))
+			elseif rec.category == "PostFX" and #rec.samples > 1 then
+				add(("     changed %d times | first %s | last %s"):format(#rec.samples - 1,
+					safeEncode(rec.samples[1].v), safeEncode(rec.samples[#rec.samples].v)))
+			end
+		end
+		if #vfxList == 0 then add("  (none)") end
+
+		add("")
+		add("[3B] MODELS / WORLD MODELS / SPAWNED PARTS (clones are in Dex > Models, full data in models.json)")
+		if #modelList == 0 then
+			add(CONFIG.RecordModels and "  (none)" or "  (Record Models was switched off)")
+		else
+			for _, rec in ipairs(modelList) do
+				add(("  M#%d %s \"%s\" origin=%s | parts=%d | size=%s"):format(
+					rec.id, rec.class, rec.name, rec.origin, rec.partCount, vec(rec.size)))
+				add("     path: " .. rec.path)
+				add(("     active: %s -> %s%s"):format(fmtT(rec.start), fmtT(rec.removed or length),
+					rec.removed and "" or " (until end of recording)"))
+				local first, last = rec.samples[1], rec.samples[#rec.samples]
+				local travel = 0
+				for i = 2, #rec.samples do
+					travel += (rec.samples[i].cf.Position - rec.samples[i - 1].cf.Position).Magnitude
+				end
+				add(("     motion (relative to root): %s -> %s | travel %.1f studs | %d samples"):format(
+					vec(first.cf.Position), vec(last.cf.Position), travel, #rec.samples))
+				local changing = 0
+				for _, s in ipairs(rec.subs) do
+					if #s.samples > 1 then changing += 1 end
+				end
+				add(("     inner parts tracked: %d (%d changed over time) | reference part: %s"):format(
+					#rec.subs, changing, #rec.refPath > 0 and table.concat(rec.refPath, "/") or "(the part itself)"))
+				local ev = {}
+				for _, e in ipairs(rec.events) do table.insert(ev, ("%s %.3f"):format(e.kind, e.t)) end
+				add("     events: " .. table.concat(ev, " | "))
+				if #rec.assetIds > 0 then add("     assets: " .. table.concat(rec.assetIds, ", ")) end
+			end
+		end
+
+		add("")
+		add("[4] ASSETS REQUIRED (ids you must have access to)")
+		if #assetOrder == 0 then
+			add("  (none)")
+		else
+			table.sort(assetOrder)
+			for _, raw in ipairs(assetOrder) do
+				local a = assets[raw]
+				add(("  %s  [%s]  used by: %s"):format(raw, a.kind, table.concat(a.userList, ", ")))
+			end
+		end
+
+		add("")
+		add("[5] CAMERA")
+		local n = #camSamples
+		if n == 0 then
+			add("  No camera samples.")
+		else
+			local minFov, maxFov, minD, maxD, pathLen = math.huge, -math.huge, math.huge, -math.huge, 0
+			for i, s in ipairs(camSamples) do
+				minFov, maxFov = math.min(minFov, s.fov), math.max(maxFov, s.fov)
+				local d = s.rel.Position.Magnitude
+				minD, maxD = math.min(minD, d), math.max(maxD, d)
+				if i > 1 then pathLen += (s.rel.Position - camSamples[i - 1].rel.Position).Magnitude end
+			end
+			add(("  samples: %d over %.3fs (~%.0f/s)"):format(n, length, n / math.max(length, 1e-3)))
+			add(("  CameraType start: %s | end: %s"):format(tostring(camStart.type), tostring(camEnd.type)))
+			add(("  CameraSubject start: %s | end: %s"):format(tostring(camStart.subject), tostring(camEnd.subject)))
+			add(("  FOV: min %.1f, max %.1f%s"):format(minFov, maxFov, (maxFov - minFov) > 0.05 and " (FOV animates)" or " (constant)"))
+			add(("  distance from root: min %.2f, max %.2f | camera travel (relative to root): %.2f studs"):format(minD, maxD, pathLen))
+			add("  path (relative to HumanoidRootPart; pos / rot degrees / fov):")
+			local nextT, step = 0, math.max(0.25, length / 80)
+			for _, s in ipairs(camSamples) do
+				if s.t >= nextT then
+					add(("  %s pos=%s rot=%s fov=%.1f"):format(fmtT(s.t), vec(s.rel.Position), rotDeg(s.rel), s.fov))
+					nextT += step
+				end
+			end
+		end
+		local fxCount = 0
+		for _, rec in ipairs(fxRecs) do
+			fxCount += 1
+			if fxCount == 1 then add("  Post-processing used (see also [3]):") end
+			add(("    #%d %s \"%s\" parent=%s"):format(rec.id, rec.class, rec.name, rec.host.parent))
+		end
+
+		add("")
+		add("[6] MODULES / DEPENDENCIES")
+		add("  Recorder uses: Players, RunService, UserInputService, TweenService, HttpService, ReplicatedStorage, Lighting, SoundService, Workspace")
+		add(("  Optional executor APIs: setclipboard=%s writefile=%s hookmetamethod(Emit)=%s"):format(
+			tostring(setClipboard ~= nil), tostring(writeFile ~= nil), tostring(CAP.emitHook)))
+		add("  Camera playback needs: workspace.CurrentCamera, CameraType = Scriptable, FieldOfView writable")
+		add("  Animation playback needs: Motor6D joints (Neck, Left/Right Shoulder, Left/Right Hip, RootJoint) and no active Animator on the rig")
+		if #scriptsFound > 0 then
+			add("  Scripts found inside tracked VFX / models (runnable scripts were NOT copied into the archive):")
+			for _, sc in ipairs(scriptsFound) do
+				add(("    %s: %s (%s) %s"):format(sc.vfx and ("VFX #" .. sc.vfx) or ("MODEL M#" .. tostring(sc.model)),
+					sc.name, sc.class, sc.path))
+			end
+		end
+		if #depLines > 0 then
+			add("  Detected scripts that may drive these effects (heuristic, names only):")
+			for _, l in ipairs(depLines) do add(l) end
+		end
+
+		add("")
+		add("[7] NOTES FOR THE ANIMATOR")
+		local bursts = {}
+		for _, rec in ipairs(vfxList) do
+			if rec.class == "ParticleEmitter" and rec.origin == "present_at_start" and rec.props.Enabled == false then
+				local toggled = false
+				for _, e in ipairs(rec.events) do
+					if e.kind == "ENABLED" or e.kind == "EMIT" then toggled = true end
+				end
+				if not toggled then table.insert(bursts, "#" .. rec.id) end
+			end
+		end
+		if #bursts > 0 then
+			add("  - Emitters never enabled or emitted during recording (" .. table.concat(bursts, ", ") .. ") are probably fired with :Emit().")
+			if CAP.emitHook then
+				add("    Emit() was hooked, so these simply did not fire in this recording.")
+			else
+				add("    This executor has no hookmetamethod, so the exact trigger time is NOT in the timeline - align them by eye with the animation.")
+			end
+		end
+		if CAP.emitHook then
+			add("  - Emitter :Emit() calls were hooked and recorded (EMIT events + emits in vfx.json). The REPLAY fires them at the same times.")
+		end
+		add("  - Effect parts (category EffectPart) are found heuristically: parts spawned near you that are Neon/transparent/non-collide.")
+		add("    Some may be unrelated; check the host/path and motion before using them.")
+		add("  - Models ([3B], Dex > Models, models.json): Models / WorldModels / loose parts that spawned near you. Positions are relative to HumanoidRootPart;")
+		add("    up to " .. CONFIG.ModelSubParts .. " inner parts per model also have their own CFrame/Size/Transparency/Color samples. Parts added to a model after it spawned are not in its clone.")
+		add("  - Camera 'rel' values are relative to HumanoidRootPart at each frame; camera.json also has world CFrames.")
+		add("  - Send these files together: report.txt, vfx.json, models.json, camera.json, animation.json (or the r6recorder/" .. sessionName .. " folder).")
+
+		return buf.text()
+	end
+
+	local JOINT_NAMES = { "Torso", "Head", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }
+
+	local function numStr(x)
+		local s = ("%.3f"):format(x)
+		s = s:gsub("0+$", ""):gsub("%.$", "")
+		if s == "-0" or s == "" then s = "0" end
+		return s
+	end
+
+	local function cfCode(cf)
+		local rx, ry, rz = cf:ToOrientation()
+		local p = cf.Position
+		local rot = ("%s,%s,%s"):format(numStr(math.deg(rx)), numStr(math.deg(ry)), numStr(math.deg(rz)))
+		if p.Magnitude < 0.002 then
+			return "R(" .. rot .. ")"
+		end
+		return ("PR(%s,%s,%s,%s)"):format(numStr(p.X), numStr(p.Y), numStr(p.Z), rot)
+	end
+
+	local function frameError(fr, a, b, i)
+		local fa, fb, fi = fr[a], fr[b], fr[i]
+		local alpha = (fi.t - fa.t) / math.max(fb.t - fa.t, 1e-6)
+		local worst = 0
+		for _, name in ipairs(JOINT_NAMES) do
+			local ca, cb, ci = fa.poses[name], fb.poses[name], fi.poses[name]
+			if ca and cb and ci then
+				local interp = ca:Lerp(cb, alpha)
+				local posErr = (interp.Position - ci.Position).Magnitude
+				local _, angle = interp:ToObjectSpace(ci):ToAxisAngle()
+				worst = math.max(worst, posErr + math.abs(angle))
+			end
+		end
+		return worst
+	end
+
+	local function reduceKeyframes(fr, tol, maxKeep)
+		local n = #fr
+		local order, errs = { 1 }, { math.huge }
+		if n < 2 then return order, errs, 0 end
+		order[2], errs[2] = n, math.huge
+
+		local segs = {}
+		local function makeSeg(a, b)
+			if b - a < 2 then return end
+			local worst, idx = 0, nil
+			for i = a + 1, b - 1 do
+				local e = frameError(fr, a, b, i)
+				if e > worst or not idx then worst, idx = e, i end
+				slice()
+			end
+			if idx then segs[#segs + 1] = { a = a, b = b, err = worst, idx = idx } end
+		end
+
+		makeSeg(1, n)
+		while #segs > 0 and #order < maxKeep do
+			local bi = 1
+			for i = 2, #segs do
+				if segs[i].err > segs[bi].err then bi = i end
+			end
+			local s = table.remove(segs, bi)
+			if s.err <= tol then
+				table.insert(segs, s)
+				break
+			end
+			order[#order + 1] = s.idx
+			errs[#errs + 1] = s.err
+			makeSeg(s.a, s.idx)
+			makeSeg(s.idx, s.b)
+		end
+
+		local residual = 0
+		for _, s in ipairs(segs) do residual = math.max(residual, s.err) end
+		return order, errs, residual
+	end
+
+	local function buildKeyframeCode(sessionName)
+		local n = #frames
+		if n == 0 then return "-- no keyframes recorded" end
+		local t0 = frames[1].t
+		local order, errs, finalResidual = reduceKeyframes(frames, CONFIG.AnimTolerance, CONFIG.AnimMaxKeyframes)
+
+		local rootLen = 0
+		for i = 2, n do
+			rootLen += (frames[i].root.Position - frames[i - 1].root.Position).Magnitude
+		end
+		local lastRoot = frames[n].root
+
+		local function render(count)
+			local set = {}
+			for i = 1, count do set[order[i]] = true end
+			local idxs = {}
+			for idx in pairs(set) do idxs[#idxs + 1] = idx end
+			table.sort(idxs)
+			local residual = errs[count + 1] or finalResidual
+
+			local lines = {}
+			local function add(s) lines[#lines + 1] = s end
+			add(("-- R6 KeyframeSequence rebuilt by R6 Recorder | %s | %.3fs | %d keyframes (reduced from %d, max error ~%.3f)"):format(
+				sessionName, frames[n].t - t0, #idxs, n, residual))
+			add(("-- Root motion is NOT included: traveled %.1f studs, final offset %s"):format(
+				rootLen, vec(lastRoot.Position)))
+			add("-- Run in the Roblox Studio command bar or a Script. It builds the KeyframeSequence in workspace; move/import it as you like.")
+			add("-- R(x,y,z) = joint rotation in degrees. PR(px,py,pz,x,y,z) = joint offset in studs + rotation in degrees.")
+			add("local ks = Instance.new(\"KeyframeSequence\")")
+			add(("ks.Name = %q"):format(sessionName))
+			add([==[
+ks.Loop = true
+ks.Priority = Enum.AnimationPriority.Action
+
+local function R(x, y, z) return CFrame.fromOrientation(math.rad(x), math.rad(y), math.rad(z)) end
+local function PR(px, py, pz, x, y, z) return CFrame.new(px, py, pz) * R(x, y, z) end
+
+local function P(name, cf, parent)
+	local p = Instance.new("Pose")
+	p.Name = name
+	p.CFrame = cf
+	p.Weight = 1
+	p.EasingStyle = Enum.PoseEasingStyle.Linear
+	p.EasingDirection = Enum.PoseEasingDirection.Out
+	p.Parent = parent
+	return p
+end
+
+-- K(time, joints): one Keyframe = HumanoidRootPart > Torso > Head / arms / legs
+local function K(t, j)
+	local kf = Instance.new("Keyframe")
+	kf.Time = t
+	local root = P("HumanoidRootPart", CFrame.new(), kf)
+	local torso = P("Torso", j.Torso, root)
+	for _, n in ipairs({ "Head", "Left Arm", "Right Arm", "Left Leg", "Right Leg" }) do
+		if j[n] then P(n, j[n], torso) end
+	end
+	kf.Parent = ks
+end
+]==])
+			for _, idx in ipairs(idxs) do
+				local f = frames[idx]
+				local parts = {}
+				for _, name in ipairs(JOINT_NAMES) do
+					local cf = f.poses[name]
+					if cf then
+						local key = name:find(" ", 1, true) and ('["' .. name .. '"]') or name
+						table.insert(parts, key .. "=" .. cfCode(cf))
+					end
+				end
+				add(("K(%s, { %s })"):format(numStr(f.t - t0), table.concat(parts, ", ")))
+			end
+			add("ks.Parent = workspace")
+			return table.concat(lines, "\n")
+		end
+
+		local count = #order
+		local code = render(count)
+		while #code > CONFIG.CopyLimit and count > 4 do
+			count = math.max(4, math.floor(count * 0.85))
+			code = render(count)
+			slice()
+		end
+		return code
+	end
+
+	local function buildQuickList(sessionName, length)
+		local buf = newBuf()
+		local add = buf.add
+
+		add(("===== VFX QUICK LIST - %s - %.3fs - %d effects, %d models ====="):format(sessionName, length, #vfxList, #modelList))
+		if #vfxList == 0 then add("(no VFX detected)") end
+		for _, rec in ipairs(vfxList) do
+			local endT = rec.removed or length
+			add(("#%d %s \"%s\" [%s] on %s"):format(rec.id, rec.class, rec.name, rec.category, rec.host.label))
+			add(("   time: %.3fs -> %.3fs%s"):format(rec.start, endT, rec.removed and "" or " (until end)"))
+			local ev = {}
+			for _, e in ipairs(rec.events) do
+				table.insert(ev, ("%s %.3f"):format(e.kind, e.t))
+			end
+			add("   events: " .. table.concat(ev, " | "))
+			if #rec.emits > 0 then add(("   emit calls: %d"):format(#rec.emits)) end
+			if #rec.assetIds > 0 then add("   assets: " .. table.concat(rec.assetIds, ", ")) end
+		end
+
+		if #modelList > 0 then
+			add("")
+			add(("MODELS / WORLD MODELS / SPAWNED PARTS (%d) - clones in Dex > Models, data in models.json:"):format(#modelList))
+			for _, rec in ipairs(modelList) do
+				add(("M#%d %s \"%s\" parts=%d"):format(rec.id, rec.class, rec.name, rec.partCount))
+				add(("   time: %.3fs -> %.3fs%s"):format(rec.start, rec.removed or length, rec.removed and "" or " (until end)"))
+				if #rec.assetIds > 0 then add("   assets: " .. table.concat(rec.assetIds, ", ")) end
+			end
+		end
+
+		add("")
+		add((REC.victim and "VICTIM" or "PLAYER") .. " ANIMATION: KeyframeSequence code is in keyframe_sequence.lua (also in the full copy below).")
+		if #animEvents > 0 then
+			add("Game animation tracks that were playing (names/times only):")
+			for _, ev in ipairs(animEvents) do
+				add(("   %.3fs -> %.3fs  \"%s\""):format(ev.start, ev.stop or length, ev.name))
+			end
+		end
+
+		if #camSamples > 0 then
+			local minFov, maxFov = math.huge, -math.huge
+			for _, s in ipairs(camSamples) do
+				minFov, maxFov = math.min(minFov, s.fov), math.max(maxFov, s.fov)
+			end
+			add("")
+			add(("CAMERA: %d samples, FOV %.1f-%.1f, saved in camera.json / Camera folder"):format(#camSamples, minFov, maxFov))
+		end
+		return buf.text()
+	end
+
+	local function saveToDisk(sessionName, files, latestFiles)
+		if not (CONFIG.SaveToDisk and writeFile and makeFolder) then return false, nil, {} end
+		local base = CONFIG.FolderName .. "/" .. sessionName
+		local function mk(path)
+			if isFolder then
+				local ok, exists = pcall(isFolder, path)
+				if ok and exists then return end
+			end
+			pcall(makeFolder, path)
+		end
+		mk(CONFIG.FolderName)
+		mk(base)
+		local failed = {}
+		for name, data in pairs(files) do
+			local ok = pcall(writeFile, base .. "/" .. name, data)
+			if not ok then table.insert(failed, name) end
+			slice()
+		end
+		for name, data in pairs(latestFiles or {}) do
+			local ok = pcall(writeFile, CONFIG.FolderName .. "/" .. name, data)
+			if not ok then table.insert(failed, name) end
+			slice()
+		end
+		return #failed == 0, base, failed
+	end
+
+	local function pruneSessions(rootFolder)
+		local list = {}
+		for _, c in ipairs(rootFolder:GetChildren()) do
+			if c:IsA("Folder") then list[#list + 1] = c end
+		end
+		table.sort(list, function(a, b) return (a:GetAttribute("Created") or 0) < (b:GetAttribute("Created") or 0) end)
+		while #list >= math.max(CONFIG.KeepSessions, 1) do
+			local oldest = table.remove(list, 1)
+			pcall(function() oldest:Destroy() end)
+		end
+	end
+
+	local function stage(frac, text)
+		setProgress(frac)
+		if text then setStatus(text, THEME.ok, true) end
+		task.wait()
+		resetSlice()
+	end
+
+	local function buildKeyframeSequence(sessionName, onProgress)
+		local ks = Instance.new("KeyframeSequence")
+		ks.Name = sessionName
+		ks.Loop = true
+		ks.Priority = Enum.AnimationPriority.Action
+		ks.Archivable = true
+
+		local function newPose(name, cf)
+			local p = Instance.new("Pose")
+			p.Name = name
+			p.CFrame = cf
+			p.Weight = 1
+			return p
+		end
+
+		local n = #frames
+		for i = 1, n do
+			local f = frames[i]
+			local kf = Instance.new("Keyframe")
+			kf.Time = f.t
+			local rootPose = newPose("HumanoidRootPart", CFrame.new())
+			local torsoPose = newPose("Torso", f.poses.Torso or CFrame.new())
+			torsoPose.Parent = rootPose
+			for _, data in ipairs(JOINTS) do
+				local cf = f.poses[data.partName]
+				if cf then
+					local pose = newPose(data.partName, cf)
+					pose.EasingStyle = Enum.PoseEasingStyle.Linear
+					pose.EasingDirection = Enum.PoseEasingDirection.Out
+					pose.Parent = torsoPose
+				end
+			end
+			rootPose.Parent = kf
+			kf.Parent = ks
+			if i % 25 == 0 then
+				slice()
+				if onProgress then onProgress(i / n) end
+			end
+		end
+		return ks
+	end
+
+	function X.finalize(length)
+		resetSlice()
+		local sessionName = REC.prefix .. os.date("%H%M%S")
+		local camEnd = cameraMeta()
+		local nFrames, nCam, nVfx, nModels = #frames, #camSamples, #vfxList, #modelList
+
+		for track, ev in pairs(activeTracks) do
+			ev.stop = ev.stop or length
+			activeTracks[track] = nil
+		end
+
+		stage(0.04, "Building KeyframeSequence...")
+		local ks = buildKeyframeSequence(sessionName, function(f) setProgress(0.04 + 0.26 * f) end)
+
+		stage(0.32, "Creating Dex folders...")
+		local rootFolder = ReplicatedStorage:FindFirstChild(CONFIG.DexFolderName)
+		if not rootFolder then
+			rootFolder = Instance.new("Folder")
+			rootFolder.Name = CONFIG.DexFolderName
+			rootFolder.Parent = ReplicatedStorage
+		end
+		pruneSessions(rootFolder)
+		local session = Instance.new("Folder")
+		session.Name = sessionName
+		setAttr(session, "Created", os.time())
+		session.Parent = rootFolder
+		ks.Parent = session
+		local vfxFolder = Instance.new("Folder")
+		vfxFolder.Name = "VFX"
+		vfxFolder.Parent = session
+		local modelFolder = Instance.new("Folder")
+		modelFolder.Name = "Models"
+		modelFolder.Parent = session
+		local camFolder = Instance.new("Folder")
+		camFolder.Name = "Camera"
+		camFolder.Parent = session
+		local reportFolder = Instance.new("Folder")
+		reportFolder.Name = "Report"
+		reportFolder.Parent = session
+
+		for i, rec in ipairs(vfxList) do
+			local c = rec.clone
+			if c then
+				setAttr(c, "StartTime", rnd(rec.start))
+				setAttr(c, "EndTime", rnd(rec.removed or length))
+				setAttr(c, "StillActiveAtEnd", rec.removed == nil)
+				setAttr(c, "Category", rec.category)
+				setAttr(c, "Origin", rec.origin)
+				setAttr(c, "HostPart", rec.host.part or "")
+				setAttr(c, "HostAttachment", rec.host.attachment or "")
+				setAttr(c, "OriginalPath", rec.path)
+				setAttr(c, "RecorderId", rec.id)
+				setAttr(c, "OriginalName", rec.name)
+				setAttr(c, "InitialEnabled", rec.props.Enabled)
+				setAttr(c, "EventsJson", fitAttrJson(rec.events, 60000))
+				if #rec.emits > 0 then
+					local list = {}
+					for k, e in ipairs(rec.emits) do
+						if k > 1500 then break end
+						list[k] = { rnd(e.t), e.n }
+					end
+					setAttr(c, "EmitsJson", fitAttrJson(list, 60000))
+				end
+				if rec.hostAttCF then setAttr(c, "HostAttachmentCFrame", rec.hostAttCF) end
+				if rec.hostRel then setAttr(c, "HostRelToRoot", rec.hostRel) end
+				if rec.hostModelId then setAttr(c, "HostModelId", rec.hostModelId) end
+				if rec.relCF then
+					setAttr(c, "RelPosToRoot", rec.relCF.Position)
+					local rx, ry, rz = rec.relCF:ToOrientation()
+					setAttr(c, "RelRotToRootDeg", Vector3.new(math.deg(rx), math.deg(ry), math.deg(rz)))
+				end
+				c.Parent = vfxFolder
+			end
+			if i % 5 == 0 then slice() end
+		end
+
+		for i, rec in ipairs(modelList) do
+			local c = rec.clone
+			if c then
+				setAttr(c, "StartTime", rnd(rec.start))
+				setAttr(c, "EndTime", rnd(rec.removed or length))
+				setAttr(c, "StillActiveAtEnd", rec.removed == nil)
+				setAttr(c, "Origin", rec.origin)
+				setAttr(c, "OriginalPath", rec.path)
+				setAttr(c, "OriginalName", rec.name)
+				setAttr(c, "OriginalClass", rec.class)
+				setAttr(c, "RecorderId", rec.id)
+				setAttr(c, "PartCount", rec.partCount)
+				setAttr(c, "ReferencePart", table.concat(rec.refPath, "/"))
+				setAttr(c, "RelCFrameStart", rec.rel0)
+				setAttr(c, "EventsJson", fitAttrJson(rec.events, 60000))
+				c.Parent = modelFolder
+			end
+			if i % 5 == 0 then slice() end
+		end
+
+		stage(0.38, "Reducing keyframes + building code...")
+		local animCode = buildKeyframeCode(sessionName)
+		stage(0.5, "Building VFX list...")
+		local quickList = buildQuickList(sessionName, length)
+		stage(0.56, "Scanning related scripts...")
+		local depLines = scanDependencies(rootFolder)
+		stage(0.62, "Building full report...")
+		local detail = buildReport(sessionName, length, camEnd, depLines)
+		local allText = quickList .. "\n\n===== " .. (REC.victim and "VICTIM" or "PLAYER") .. " ANIMATION - KEYFRAMESEQUENCE CODE (paste into Studio) =====\n"
+			.. animCode .. "\n\n" .. detail
+
+		local copyList = (fitText(quickList, CONFIG.CopyLimit))
+		local copyAnim = animCode
+		local copyAll = (fitText(allText, CONFIG.CopyAllLimit))
+
+		stage(0.68, "Encoding VFX data...")
+		local vfxJson = buildVFXJson()
+		stage(0.73, "Encoding model data...")
+		local modelJson = buildModelsJson()
+		stage(0.78, "Encoding camera data...")
+		local camJson = buildCameraJson(length)
+		stage(0.84, "Encoding animation data...")
+		local animJson = buildAnimationJson(sessionName, length)
+
+		stage(0.9, "Saving to Dex...")
+		storeLongString(session, "VFX_List", (fitText(quickList, CONFIG.DexStringLimit)))
+		storeLongString(session, "KeyframeSequence_Code", copyAnim)
+		storeLongString(reportFolder, "Report", (fitText(allText, CONFIG.DexStringLimit)))
+		storeLongString(reportFolder, "VFXData", dexJson(vfxJson, "vfx.json"))
+		storeLongString(reportFolder, "ModelData", dexJson(modelJson, "models.json"))
+		storeLongString(camFolder, "CameraData", dexJson(camJson, "camera.json"))
+		setAttr(camFolder, "Samples", nCam)
+		setAttr(camFolder, "Length", rnd(length))
+
+		stage(0.95, "Copying + writing files...")
+		local copied = false
+		if CONFIG.AutoClipboard and setClipboard then
+			copied = pcall(setClipboard, copyAll) == true
+		end
+
+		local savedOk, diskPath, failed = saveToDisk(sessionName, {
+			["vfx_list.txt"] = quickList, ["keyframe_sequence.lua"] = animCode, ["report.txt"] = allText,
+			["vfx.json"] = vfxJson, ["models.json"] = modelJson, ["camera.json"] = camJson, ["animation.json"] = animJson,
+		}, {
+			["latest_vfx_list.txt"] = quickList, ["latest_keyframe_sequence.lua"] = animCode, ["latest_report.txt"] = allText,
+		})
+
+		lastReport = copyAll
+		lastList = copyList
+		lastAnimCode = copyAnim
+		lastSession = {
+			ks = ks, cam = camSamples, name = sessionName, length = length, noFrames = nFrames == 0,
+			vfx = VR.snapshot(length), models = VR.snapshotModels(length),
+		}
+
+		frames = {}
+		vfxList, vfxByInst, partRecs, fxRecs, watchRecs = {}, {}, {}, {}, {}
+		modelList, modelByInst = {}, {}
+		assets, assetOrder, scriptsFound = {}, {}, {}
+		qReset()
+
+		setReport(copyAll)
+		setReportOpen(true)
+		setStats(length, nFrames, nCam, nVfx, nModels)
+
+		local diskLine
+		if not (writeFile and makeFolder) then
+			diskLine = "Disk: no writefile here - use the Dex folder or the clipboard."
+		elseif savedOk then
+			diskLine = "Disk: workspace/" .. diskPath .. "/ (7 files, full size)"
+		else
+			diskLine = "Disk: workspace/" .. diskPath .. "/ but these failed: " .. table.concat(failed, ", ")
+		end
+		local parts = {
+			("Saved %s: %d VFX, %d models, %d cam, %d frames."):format(sessionName, nVfx, nModels, nCam, nFrames),
+			"Dex: ReplicatedStorage > " .. CONFIG.DexFolderName .. " > " .. sessionName,
+			diskLine,
+			copied and ("Copied to clipboard (%s chars)."):format(formatNum(#copyAll)) or "No clipboard API - use the viewer.",
+		}
+		stage(1, table.concat(parts, "\n"))
+		notify(copied and "Saved - report copied to clipboard" or "Saved - see Dex / disk folder", "ok")
+		task.delay(0.9, function() setProgress(nil) end)
+	end
+
+	return X
+end)()
+
+local function setRecordingUI(isRecording)
+	recBtn.setText(isRecording and "STOP RECORDING" or "START RECORDING")
+	recBtn.setColor(isRecording and THEME.go or THEME.rec)
+	setPulse(isRecording)
+	recTimer.Text = isRecording and "00:00.0" or ""
+	if not isRecording then setSubtitle("v9 - ready") end
+end
+
+function startRecording()
+	if finalizing then
+		notify("Still saving the last recording...", "warn")
+		return
+	end
+	if humanoid.RigType ~= Enum.HumanoidRigType.R6 then
+		notify("This tool only supports R6 characters.", "err")
+		setStatus("This tool only supports R6 characters.", THEME.warn)
+		return
+	end
+	local root = getRoot()
+	if not root or not character:FindFirstChild("Torso") then
+		notify("Character is missing HumanoidRootPart/Torso.", "err")
+		return
+	end
+
+	local modeKey = UI.getMode()
+	local spec = MODES[modeKey] or MODES.full
+	local victim = nil
+	if modeKey == "victim" then
+		local nameText = UI.getVictim()
+		if nameText == "" then
+			notify("Type the victim name or username first.", "warn")
+			setStatus("Victim mode: type the victim name / username in the box next to the mode button.", THEME.warn)
+			return
+		end
+		local found, err = MODES.find(nameText)
+		if not found then
+			notify(err, "err")
+			setStatus(err, THEME.warn)
+			return
+		end
+		victim = found
+	end
+	REC.pose, REC.cam, REC.vfx, REC.models = spec.pose, spec.cam, spec.vfx, spec.models
+	REC.tracks = spec.pose and victim == nil
+	REC.target = victim
+	REC.mode, REC.label, REC.prefix = modeKey, spec.label, spec.prefix
+	REC.victim = victim and victim.Name or nil
+
+	PB.stopCamera()
+	PB.stopVFX()
+	if testClone then
+		testClone:Destroy()
+		testClone = nil
+	end
+
+	frames, camSamples = {}, {}
+	frameStride, frameCounter, camStride, camCounter = 1, 0, 1, 0
+	vfxList, vfxByInst, partRecs, fxRecs, watchRecs = {}, {}, {}, {}, {}
+	modelList, modelByInst = {}, {}
+	effectPartCount, cloneCount, capNotified = 0, 0, false
+	assets, assetOrder = {}, {}
+	animEvents, activeTracks = {}, {}
+	scriptsFound = {}
+	recent = {}
+	qReset()
+	CAP.reset()
+	if REC.vfx then CAP.startHooks() else CAP.emitHook = false end
+	camStart = cameraMeta()
+	startRootCF = (victim and victim:FindFirstChild("HumanoidRootPart") or root).CFrame
+	startClock = os.clock()
+	recording = true
+	setRecordingUI(true)
+	setActionsEnabled(false, lastReport ~= nil)
+	setStats(0, 0, 0, 0, 0)
+
+	if REC.vfx then
+		for _, inst in ipairs(character:GetDescendants()) do
+			if CLASS_CATEGORY[inst.ClassName] and CAP.shouldTrack(inst, root) then CAP.register(inst, 0, true) end
+		end
+		for _, container in ipairs({ Lighting, Workspace.CurrentCamera }) do
+			if container then
+				for _, inst in ipairs(container:GetChildren()) do
+					if CLASS_CATEGORY[inst.ClassName] == "PostFX" and CAP.shouldTrack(inst, root) then CAP.register(inst, 0, true) end
+				end
+			end
+		end
+	end
+
+	local okScan, errScan = pcall(CAP.scanPresentModels, root)
+
+	if REC.vfx or REC.models then
+		table.insert(conns, Workspace.DescendantAdded:Connect(CAP.onAdded))
+		table.insert(conns, Lighting.DescendantAdded:Connect(CAP.onAdded))
+		table.insert(conns, SoundService.DescendantAdded:Connect(CAP.onAdded))
+	end
+	table.insert(conns, RunService.Heartbeat:Connect(CAP.recordFrame))
+	if REC.cam then table.insert(conns, RunService.RenderStepped:Connect(CAP.recordCamera)) end
+	table.insert(conns, humanoid.Died:Connect(function() stopRecording() end))
+
+	refreshHud(true)
+end
+
+function stopRecording()
+	if not recording then return end
+	local length = now()
+	recording = false
+	for _, c in ipairs(conns) do c:Disconnect() end
+	table.clear(conns)
+	setRecordingUI(false)
+
+	if (REC.pose and #frames < 5) or (not REC.pose and length < 0.3) then
+		notify("Record longer! (need at least a few frames)", "warn")
+		setStatus("Record longer! (need at least a few frames)", THEME.warn)
+		setActionsEnabled(lastSession ~= nil, true)
+		return
+	end
+
+	finalizing = true
+	setActionsEnabled(false, false)
+	recBtn.setEnabled(false)
+	recBtn.setText("PROCESSING...")
+	setSubtitle("Processing...", THEME.accent)
+	setStatus("Building report...")
+	setProgress(0.02)
+	task.spawn(function()
+		local ok, err = xpcall(EX.finalize, debug.traceback, length)
+		if not ok then
+			setStatus("Export failed - see the output/console for details.", THEME.warn)
+			notify("Export failed - see output", "err")
+			setProgress(nil)
+		end
+		finalizing = false
+		recBtn.setEnabled(true)
+		recBtn.setText("START RECORDING")
+		setSubtitle("v9 - ready")
+		setActionsEnabled(lastSession ~= nil, lastReport ~= nil)
+		if ok and CONFIG.AutoReplay then
+			task.wait(0.4)
+			pcall(PB.replay, true)
+		end
+	end)
+end
+
+recBtn.onClick(function()
+	if finalizing then return end
+	if recording then stopRecording() else startRecording() end
+end)
+
+UI.replayBtn.onClick(function() PB.replay() end)
+
+UI.setVfxOn(CONFIG.ReplayVFX, true)
+UI.onVfxToggle = function(on)
+	CONFIG.ReplayVFX = on
+	notify(on and "VFX replay ON" or "VFX replay OFF", on and "ok" or "warn")
+end
+
+UI.setModelsOn(CONFIG.RecordModels, true)
+UI.onModelsToggle = function(on)
+	CONFIG.RecordModels = on
+	notify(on and "Model recording + replay ON" or "Model recording + replay OFF", on and "ok" or "warn")
+end
+
+local function copyText(text, what)
+	if not text or text == "" then
+		notify("Nothing to copy yet.", "warn")
+		return
+	end
+	if setClipboard and pcall(setClipboard, text) then
+		notify(("%s copied (%s chars)"):format(what, formatNum(#text)), "ok")
+		setStatus(what .. " copied to clipboard.")
+	else
+		notify("No clipboard API - use the on-screen report or the saved files", "warn")
+	end
+end
+
+UI.copyListBtn.onClick(function() copyText(lastList, "VFX list") end)
+UI.copyAnimBtn.onClick(function() copyText(lastAnimCode, "KeyframeSequence code") end)
+UI.copyBtn.onClick(function() copyText(lastReport, "List + full report") end)
+
+gconnect(UserInputService.InputBegan, function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == CONFIG.ReplayKey then PB.replay() end
+end)
+
+gconnect(player.CharacterAdded, function(newChar)
+	character = newChar
+	humanoid = newChar:WaitForChild("Humanoid")
+	makeArchivable(newChar)
+end)
+
+local function cleanup()
+	recording = false
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	table.clear(conns)
+	for _, c in ipairs(gconns) do pcall(function() c:Disconnect() end) end
+	table.clear(gconns)
+	for _, c in ipairs(UI.conns) do pcall(function() c:Disconnect() end) end
+	table.clear(UI.conns)
+	pcall(PB.stopCamera)
+	pcall(PB.stopVFX)
+	pcall(function()
+		local s = sharedEnv.R6RecorderEmit
+		if type(s) == "table" then s.handler = nil end
+	end)
+	if testClone then pcall(function() testClone:Destroy() end) end
+	setPulse(false)
+	if UI.screenGui then UI.screenGui:Destroy() end
+	sharedEnv.R6RecorderCleanup = nil
+end
+sharedEnv.R6RecorderCleanup = cleanup
+
+UI.closeBtn.onClick(function()
+	if recording then
+		notify("Stop the recording first.", "warn")
+		return
+	end
+	if finalizing then
+		notify("Wait until saving is finished.", "warn")
+		return
+	end
+	UI.close()
+	task.delay(0.35, cleanup)
+end)
+
+setActionsEnabled(false, false)
+UI.open()
+
